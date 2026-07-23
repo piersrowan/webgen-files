@@ -7,6 +7,7 @@
 
 mod assoc;
 mod entry;
+mod meta;
 mod tree;
 
 use std::cell::{Cell, RefCell};
@@ -16,7 +17,11 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::glib::clone;
 use gtk::glib::BoxedAnyObject;
-use gtk::{gio, glib};
+use gtk::{gdk, gio, glib};
+
+/// Opens the right-click context menu for a row (anchor widget + click coords). Set once the menu
+/// model exists; the per-row gesture (built earlier, in the factory) calls through this holder.
+type MenuOpener = Rc<RefCell<Option<Rc<dyn Fn(gtk::Widget, f64, f64)>>>>;
 
 use entry::Entry;
 use webgen_registry::Registry;
@@ -72,30 +77,56 @@ fn build_ui(app: &adw::Application) {
     ));
     let filtered = gtk::FilterListModel::new(Some(store.clone()), Some(filter.clone()));
     let selection = gtk::MultiSelection::new(Some(filtered));
+    let menu_opener: MenuOpener = Rc::new(RefCell::new(None));
 
     let factory = gtk::SignalListItemFactory::new();
-    factory.connect_setup(|_, item| {
-        let item = item.downcast_ref::<gtk::ListItem>().unwrap();
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-        row.set_margin_top(3);
-        row.set_margin_bottom(3);
-        let icon = gtk::Image::new();
-        icon.set_pixel_size(24);
-        let text = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        let name = gtk::Label::new(None);
-        name.set_xalign(0.0);
-        name.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        let sub = gtk::Label::new(None);
-        sub.set_xalign(0.0);
-        sub.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        sub.add_css_class("dim-label");
-        sub.add_css_class("caption");
-        text.append(&name);
-        text.append(&sub);
-        row.append(&icon);
-        row.append(&text);
-        item.set_child(Some(&row));
-    });
+    factory.connect_setup(clone!(
+        #[strong] selection,
+        #[strong] menu_opener,
+        move |_, item| {
+            let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+            row.set_margin_top(3);
+            row.set_margin_bottom(3);
+            let icon = gtk::Image::new();
+            icon.set_pixel_size(24);
+            let text = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            let name = gtk::Label::new(None);
+            name.set_xalign(0.0);
+            name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            let sub = gtk::Label::new(None);
+            sub.set_xalign(0.0);
+            sub.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            sub.add_css_class("dim-label");
+            sub.add_css_class("caption");
+            text.append(&name);
+            text.append(&sub);
+            row.append(&icon);
+            row.append(&text);
+            item.set_child(Some(&row));
+
+            // Right-click: select this row (unless it's already in a multi-selection) then open the
+            // context menu at the pointer.
+            let gesture = gtk::GestureClick::new();
+            gesture.set_button(gdk::BUTTON_SECONDARY);
+            let li = item.clone();
+            gesture.connect_pressed(clone!(
+                #[weak] row,
+                #[weak] selection,
+                #[strong] menu_opener,
+                move |_g, _n, x, y| {
+                    let pos = li.position();
+                    if pos != gtk::INVALID_LIST_POSITION && !selection.is_selected(pos) {
+                        selection.select_item(pos, true);
+                    }
+                    if let Some(open) = menu_opener.borrow().as_ref() {
+                        open(row.upcast::<gtk::Widget>(), x, y);
+                    }
+                }
+            ));
+            row.add_controller(gesture);
+        }
+    ));
     factory.connect_bind(|_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
         let b = item.item().and_downcast::<BoxedAnyObject>().unwrap();
@@ -294,6 +325,156 @@ fn build_ui(app: &adw::Application) {
         .content(&toolbar)
         .build();
 
+    // ---- context-menu / keyboard actions (also drive the toolbar buttons) ----------------------
+    let actions = gio::SimpleActionGroup::new();
+    let mk = |name: &str| {
+        let a = gio::SimpleAction::new(name, None);
+        actions.add_action(&a);
+        a
+    };
+    mk("open").connect_activate(clone!(
+        #[strong] selection, #[strong] navigate, #[strong] reg, #[weak] window,
+        move |_, _| {
+            if let Some(e) = selected(&selection).into_iter().next() {
+                open_entry(&reg, &navigate, &window, &e);
+            }
+        }
+    ));
+    mk("open-with").connect_activate(clone!(
+        #[strong] selection, #[strong] reg, #[weak] window,
+        move |_, _| {
+            if let Some(e) = selected(&selection).into_iter().find(|e| !e.is_dir) {
+                open_with_dialog(&reg, &window, &e);
+            }
+        }
+    ));
+    mk("copy").connect_activate(clone!(
+        #[strong] selection, #[strong] clipboard, #[strong] status,
+        move |_, _| {
+            let paths: Vec<PathBuf> = selected(&selection).into_iter().map(|e| e.path).collect();
+            if !paths.is_empty() {
+                let n = paths.len();
+                *clipboard.borrow_mut() = paths;
+                status.set_text(&format!("Copied {n} item{}", if n == 1 { "" } else { "s" }));
+            }
+        }
+    ));
+    mk("paste").connect_activate(clone!(
+        #[strong] current, #[strong] clipboard, #[strong] reload, #[strong] status, #[weak] window,
+        move |_, _| {
+            let dest = current.borrow().clone();
+            let items = clipboard.borrow().clone();
+            let mut ok = 0;
+            for src in &items {
+                match entry::copy_into(src, &dest) {
+                    Ok(_) => ok += 1,
+                    Err(e) => {
+                        error_dialog(&window, &format!("Couldn't paste “{}”", src.display()), &e.to_string());
+                        break;
+                    }
+                }
+            }
+            if ok > 0 {
+                reload();
+                status.set_text(&format!("Pasted {ok} item{}", if ok == 1 { "" } else { "s" }));
+            }
+        }
+    ));
+    mk("new-folder").connect_activate(clone!(
+        #[strong] current, #[strong] reload, #[weak] window,
+        move |_, _| new_folder_dialog(&window, &current, &reload)
+    ));
+    mk("new-file").connect_activate(clone!(
+        #[strong] current, #[strong] reload, #[weak] window,
+        move |_, _| new_file_dialog(&window, &current, &reload)
+    ));
+    mk("rename").connect_activate(clone!(
+        #[strong] selection, #[strong] reload, #[weak] window,
+        move |_, _| {
+            let items = selected(&selection);
+            match items.len() {
+                1 => rename_dialog(&window, &items[0], &reload),
+                n if n > 1 => error_dialog(&window, "Rename", "Select a single item to rename."),
+                _ => {}
+            }
+        }
+    ));
+    mk("delete").connect_activate(clone!(
+        #[strong] selection, #[strong] reload, #[weak] window,
+        move |_, _| delete_selected(&window, &selected(&selection), &reload)
+    ));
+    mk("info").connect_activate(clone!(
+        #[strong] selection, #[weak] window,
+        move |_, _| {
+            if let Some(e) = selected(&selection).into_iter().next() {
+                info_dialog(&window, &e);
+            }
+        }
+    ));
+    window.insert_action_group("files", Some(&actions));
+
+    // Context menu model + opener (called by each row's right-click gesture).
+    let menu = gio::Menu::new();
+    let sec_open = gio::Menu::new();
+    sec_open.append(Some("Open"), Some("files.open"));
+    sec_open.append(Some("Open With…"), Some("files.open-with"));
+    menu.append_section(None, &sec_open);
+    let sec_new = gio::Menu::new();
+    sec_new.append(Some("New File"), Some("files.new-file"));
+    sec_new.append(Some("New Folder"), Some("files.new-folder"));
+    menu.append_section(None, &sec_new);
+    let sec_clip = gio::Menu::new();
+    sec_clip.append(Some("Copy"), Some("files.copy"));
+    sec_clip.append(Some("Paste"), Some("files.paste"));
+    menu.append_section(None, &sec_clip);
+    let sec_meta = gio::Menu::new();
+    sec_meta.append(Some("Rename"), Some("files.rename"));
+    sec_meta.append(Some("Info"), Some("files.info"));
+    menu.append_section(None, &sec_meta);
+    let sec_del = gio::Menu::new();
+    sec_del.append(Some("Delete"), Some("files.delete"));
+    menu.append_section(None, &sec_del);
+    *menu_opener.borrow_mut() = Some(Rc::new(clone!(
+        #[strong] menu,
+        move |anchor: gtk::Widget, x: f64, y: f64| {
+            let popover = gtk::PopoverMenu::from_model(Some(&menu));
+            popover.set_parent(&anchor);
+            popover.set_has_arrow(false);
+            popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            popover.connect_closed(|p| p.unparent());
+            popover.popup();
+        }
+    )));
+
+    // Keyboard: Ctrl+N new file, Delete / Shift+Delete delete (one confirm), F2 rename.
+    let keys = gtk::EventControllerKey::new();
+    keys.connect_key_pressed(clone!(
+        #[weak] window,
+        #[upgrade_or] glib::Propagation::Proceed,
+        move |_, keyval, _code, state| {
+            let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
+            let act = |name: &str| {
+                let _ = WidgetExt::activate_action(&window, name, None);
+            };
+            match keyval {
+                gdk::Key::n | gdk::Key::N if ctrl => {
+                    act("files.new-file");
+                    glib::Propagation::Stop
+                }
+                gdk::Key::Delete => {
+                    act("files.delete");
+                    glib::Propagation::Stop
+                }
+                gdk::Key::F2 => {
+                    act("files.rename");
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
+            }
+        }
+    ));
+    window.add_controller(keys);
+
     // ---- wiring --------------------------------------------------------------------------------
     btn_tree.connect_toggled(clone!(
         #[weak] tree_pane,
@@ -371,47 +552,11 @@ fn build_ui(app: &adw::Application) {
         }
     ));
 
-    btn_new.connect_clicked(clone!(
-        #[strong] current, #[strong] reload, #[weak] window,
-        move |_| new_folder_dialog(&window, &current, &reload)
-    ));
-
-    btn_copy.connect_clicked(clone!(
-        #[strong] selection, #[strong] clipboard, #[strong] status,
-        move |_| {
-            let paths: Vec<PathBuf> = selected(&selection).into_iter().map(|e| e.path).collect();
-            if !paths.is_empty() {
-                let n = paths.len();
-                *clipboard.borrow_mut() = paths;
-                status.set_text(&format!("Copied {n} item{}", if n == 1 { "" } else { "s" }));
-            }
-        }
-    ));
-    btn_paste.connect_clicked(clone!(
-        #[strong] current, #[strong] clipboard, #[strong] reload, #[strong] status,
-        move |_| {
-            let dest = current.borrow().clone();
-            let items = clipboard.borrow().clone();
-            let mut ok = 0;
-            for src in &items {
-                if entry::copy_into(src, &dest).is_ok() {
-                    ok += 1;
-                }
-            }
-            if ok > 0 {
-                reload();
-                status.set_text(&format!("Pasted {ok} item{}", if ok == 1 { "" } else { "s" }));
-            }
-        }
-    ));
-    btn_openwith.connect_clicked(clone!(
-        #[strong] selection, #[strong] reg, #[weak] window,
-        move |_| {
-            if let Some(e) = selected(&selection).into_iter().find(|e| !e.is_dir) {
-                open_with_dialog(&reg, &window, &e);
-            }
-        }
-    ));
+    // Toolbar buttons drive the same actions as the context menu / shortcuts.
+    btn_new.set_action_name(Some("files.new-folder"));
+    btn_copy.set_action_name(Some("files.copy"));
+    btn_paste.set_action_name(Some("files.paste"));
+    btn_openwith.set_action_name(Some("files.open-with"));
 
     reload();
     window.present();
@@ -462,11 +607,29 @@ fn launch(command: &str, path: &Path) {
     let _ = std::process::Command::new(command).arg(path).spawn();
 }
 
-/// Prompt for a folder name, then create it in `dir`.
-fn new_folder_dialog(window: &adw::ApplicationWindow, dir: &Rc<RefCell<PathBuf>>, reload: &Rc<dyn Fn()>) {
-    let dialog = adw::MessageDialog::new(Some(window), Some("New Folder"), None);
+/// A small error alert. Used whenever a filesystem op fails (e.g. permission denied).
+fn error_dialog(window: &adw::ApplicationWindow, heading: &str, body: &str) {
+    let dialog = adw::MessageDialog::new(Some(window), Some(heading), Some(body));
+    dialog.add_response("ok", "OK");
+    dialog.set_default_response(Some("ok"));
+    dialog.present();
+}
+
+/// Prompt for a name, then create a new folder or empty file in `dir`. `is_dir` picks which.
+fn new_item_dialog(
+    window: &adw::ApplicationWindow,
+    dir: &Rc<RefCell<PathBuf>>,
+    reload: &Rc<dyn Fn()>,
+    is_dir: bool,
+) {
+    let (title, placeholder, kind) = if is_dir {
+        ("New Folder", "Folder name", "folder")
+    } else {
+        ("New File", "File name", "file")
+    };
+    let dialog = adw::MessageDialog::new(Some(window), Some(title), None);
     let entry = gtk::Entry::new();
-    entry.set_placeholder_text(Some("Folder name"));
+    entry.set_placeholder_text(Some(placeholder));
     entry.set_activates_default(true);
     dialog.set_extra_child(Some(&entry));
     dialog.add_response("cancel", "Cancel");
@@ -479,18 +642,163 @@ fn new_folder_dialog(window: &adw::ApplicationWindow, dir: &Rc<RefCell<PathBuf>>
         clone!(
             #[strong] dir,
             #[strong] reload,
+            #[weak] window,
             move |_, resp| {
-                if resp == "create" {
-                    let name = entry.text().to_string();
-                    let name = name.trim();
-                    if !name.is_empty() {
-                        let _ = std::fs::create_dir(dir.borrow().join(name));
-                        reload();
-                    }
+                if resp != "create" {
+                    return;
+                }
+                let name = entry.text().to_string();
+                let name = name.trim();
+                if name.is_empty() {
+                    return;
+                }
+                if name.contains('/') {
+                    error_dialog(&window, title, "A name can't contain “/”.");
+                    return;
+                }
+                let target = dir.borrow().join(name);
+                if target.exists() {
+                    error_dialog(&window, title, &format!("“{name}” already exists."));
+                    return;
+                }
+                let result = if is_dir {
+                    std::fs::create_dir(&target)
+                } else {
+                    std::fs::File::create(&target).map(|_| ())
+                };
+                match result {
+                    Ok(()) => reload(),
+                    Err(e) => error_dialog(&window, &format!("Couldn't create {kind}"), &e.to_string()),
                 }
             }
         ),
     );
+    dialog.present();
+}
+
+fn new_folder_dialog(window: &adw::ApplicationWindow, dir: &Rc<RefCell<PathBuf>>, reload: &Rc<dyn Fn()>) {
+    new_item_dialog(window, dir, reload, true);
+}
+
+fn new_file_dialog(window: &adw::ApplicationWindow, dir: &Rc<RefCell<PathBuf>>, reload: &Rc<dyn Fn()>) {
+    new_item_dialog(window, dir, reload, false);
+}
+
+/// Rename a single item.
+fn rename_dialog(window: &adw::ApplicationWindow, item: &Entry, reload: &Rc<dyn Fn()>) {
+    let dialog = adw::MessageDialog::new(Some(window), Some("Rename"), None);
+    let field = gtk::Entry::new();
+    field.set_text(&item.name);
+    field.set_activates_default(true);
+    dialog.set_extra_child(Some(&field));
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("rename", "Rename");
+    dialog.set_response_appearance("rename", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("rename"));
+    dialog.set_close_response("cancel");
+    let old_path = item.path.clone();
+    let old_name = item.name.clone();
+    dialog.connect_response(
+        None,
+        clone!(
+            #[strong] reload,
+            #[weak] window,
+            move |_, resp| {
+                if resp != "rename" {
+                    return;
+                }
+                let new_name = field.text().to_string();
+                let new_name = new_name.trim();
+                if new_name.is_empty() || new_name == old_name {
+                    return;
+                }
+                if new_name.contains('/') {
+                    error_dialog(&window, "Rename", "A name can't contain “/”.");
+                    return;
+                }
+                let new_path = old_path.parent().unwrap_or(Path::new(".")).join(new_name);
+                if new_path.exists() {
+                    error_dialog(&window, "Rename", &format!("“{new_name}” already exists."));
+                    return;
+                }
+                match std::fs::rename(&old_path, &new_path) {
+                    Ok(()) => reload(),
+                    Err(e) => error_dialog(&window, "Couldn't rename", &e.to_string()),
+                }
+            }
+        ),
+    );
+    dialog.present();
+}
+
+/// Delete the selected items — always one confirmation, permanent + recursive, bailing with a
+/// sensible message on the first failure (e.g. permission denied). No per-item statting.
+fn delete_selected(window: &adw::ApplicationWindow, items: &[Entry], reload: &Rc<dyn Fn()>) {
+    if items.is_empty() {
+        return;
+    }
+    let body = if items.len() == 1 {
+        format!("Permanently delete “{}”? This cannot be undone.", items[0].name)
+    } else {
+        format!("Permanently delete these {} items? This cannot be undone.", items.len())
+    };
+    let dialog = adw::MessageDialog::new(Some(window), Some("Delete"), Some(&body));
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("delete", "Delete");
+    dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let paths: Vec<PathBuf> = items.iter().map(|e| e.path.clone()).collect();
+    dialog.connect_response(
+        None,
+        clone!(
+            #[strong] reload,
+            #[weak] window,
+            move |_, resp| {
+                if resp != "delete" {
+                    return;
+                }
+                for p in &paths {
+                    if let Err(e) = entry::remove_path(p) {
+                        error_dialog(&window, &format!("Couldn't delete “{}”", p.display()), &e.to_string());
+                        break; // bail on the first failure
+                    }
+                }
+                reload();
+            }
+        ),
+    );
+    dialog.present();
+}
+
+/// Show file/folder info: type, size, permissions (octal + rwx), owner, group.
+fn info_dialog(window: &adw::ApplicationWindow, item: &Entry) {
+    let info = match meta::gather(&item.path) {
+        Ok(i) => i,
+        Err(e) => {
+            error_dialog(window, "Couldn't read item", &e.to_string());
+            return;
+        }
+    };
+    let dialog = adw::MessageDialog::new(Some(window), Some(&info.name), None);
+    let list = gtk::ListBox::new();
+    list.set_selection_mode(gtk::SelectionMode::None);
+    list.add_css_class("boxed-list");
+    let add = |title: &str, value: &str| {
+        let row = adw::ActionRow::new();
+        row.set_title(title);
+        row.set_subtitle(value);
+        list.append(&row);
+    };
+    add("Location", &info.location);
+    add("Type", &info.kind);
+    add("Size", &info.size);
+    add("Permissions", &format!("{}  ({})", info.perms_octal, info.perms_rwx));
+    add("Owner", &info.owner);
+    add("Group", &info.group);
+    dialog.set_extra_child(Some(&list));
+    dialog.add_response("close", "Close");
+    dialog.set_default_response(Some("close"));
     dialog.present();
 }
 

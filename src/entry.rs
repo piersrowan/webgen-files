@@ -147,6 +147,16 @@ pub fn copy_into(src: &Path, dest_dir: &Path) -> std::io::Result<PathBuf> {
     Ok(target)
 }
 
+/// Delete `path`, recursively for a directory. A symlink is unlinked (never followed), so deleting
+/// a link to a folder removes the link, not the folder's contents.
+pub fn remove_path(path: &Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(path)?.file_type().is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+}
+
 fn copy_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     if src.is_dir() {
         std::fs::create_dir(dst)?;
