@@ -1,0 +1,12 @@
+# WebGen Files settings schema -- rendered generically by WebGen System Settings from the shared
+# registry (com.webgen.Files namespace). Global scalar settings only; the file associations table
+# ("Opens With") is a list, so it lives in its own System Settings pane, not here (CONTRACT.md §3).
+app_id = "com.webgen.Files"
+title  = "Files"
+
+[[setting]]
+key = "show_hidden"
+type = "bool"
+label = "Show hidden files"
+group = "View"
+default = false

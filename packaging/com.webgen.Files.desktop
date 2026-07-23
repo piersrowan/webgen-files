@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=WebGen Files
+GenericName=File Manager
+Comment=Browse, search, and open your files and folders
+# %F lets other apps hand folders to open; the binary is `webgen-files`.
+Exec=webgen-files %F
+Icon=com.webgen.Files
+Terminal=false
+Categories=System;Utility;FileManager;GTK;
+Keywords=files;file manager;folders;browse;explorer;
+StartupNotify=true
+# Must match the GApplication id so the running window maps to this entry (icon in the shell).
+StartupWMClass=com.webgen.Files

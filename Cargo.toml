@@ -1,0 +1,52 @@
+[package]
+name = "webgen-files"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["webgen <piers.rowan@webgen.com.au>"]
+rust-version = "1.80"
+description = "webgen-files -- a native GTK4/libadwaita file manager for WebGen Linux"
+
+[[bin]]
+name = "webgen-files"
+path = "src/main.rs"
+
+# Same gtk4-rs line as the rest of the family (gtk4 0.9 / libadwaita 0.7). No relm4: the
+# list/tree views are driven directly with GTK list models, which relm4's component model
+# does not fit. Built against the from-source GTK4 stack in piers group 7.3.
+[dependencies]
+gtk = { version = "0.9", package = "gtk4", features = ["v4_10"] }
+adw = { version = "0.7", package = "libadwaita", features = ["v1_4"] }
+# Shared WebGen settings registry, git-pinned at the same rev as the rest of the suite --
+# a path dep would not survive `cargo vendor` for the offline OS build (INTEGRATION.md).
+webgen-registry = { git = "ssh://git@github.com/piersrowan/webgen-registry.git", rev = "0fbdbb20c3039560d2a4bb486a0249c91059cb1a" }
+
+[profile.release]
+opt-level = 2
+strip = true
+
+# Packaging mirrors the family: ship the binary, the .desktop launcher, the settings manifest,
+# and the hicolor icons. postinst/postrm refresh the desktop + icon caches so the menu entry
+# appears even in the trigger-less WGLin chroot.
+[package.metadata.deb]
+name = "webgen-files"
+maintainer = "Piers Rowan <piers.rowan@webgen.com.au>"
+section = "utils"
+priority = "optional"
+depends = "$auto"
+maintainer-scripts = "packaging/deb-scripts"
+assets = [
+    ["target/release/webgen-files", "usr/bin/", "755"],
+    ["packaging/com.webgen.Files.desktop", "usr/share/applications/", "644"],
+    ["packaging/settings/com.webgen.Files.toml", "usr/share/webgen/settings/", "644"],
+    ["packaging/icons/hicolor/scalable/apps/com.webgen.Files.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+    ["packaging/icons/hicolor/16x16/apps/com.webgen.Files.png", "usr/share/icons/hicolor/16x16/apps/", "644"],
+    ["packaging/icons/hicolor/22x22/apps/com.webgen.Files.png", "usr/share/icons/hicolor/22x22/apps/", "644"],
+    ["packaging/icons/hicolor/24x24/apps/com.webgen.Files.png", "usr/share/icons/hicolor/24x24/apps/", "644"],
+    ["packaging/icons/hicolor/32x32/apps/com.webgen.Files.png", "usr/share/icons/hicolor/32x32/apps/", "644"],
+    ["packaging/icons/hicolor/48x48/apps/com.webgen.Files.png", "usr/share/icons/hicolor/48x48/apps/", "644"],
+    ["packaging/icons/hicolor/64x64/apps/com.webgen.Files.png", "usr/share/icons/hicolor/64x64/apps/", "644"],
+    ["packaging/icons/hicolor/128x128/apps/com.webgen.Files.png", "usr/share/icons/hicolor/128x128/apps/", "644"],
+    ["packaging/icons/hicolor/256x256/apps/com.webgen.Files.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
+    ["packaging/icons/hicolor/512x512/apps/com.webgen.Files.png", "usr/share/icons/hicolor/512x512/apps/", "644"],
+]

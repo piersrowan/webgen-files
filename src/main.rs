@@ -1,0 +1,575 @@
+//! WebGen Files — a native GTK4/libadwaita file manager for the WebGen family.
+//!
+//! Left: a collapsible folder tree ([`tree`]). Right: the current folder's files + subfolders with
+//! icons ([`entry`]). New Folder, Copy/Paste, Open, Open With…, and a filter/search box scoped to
+//! the current folder (with a Recursive option). "Open" honours the shared "Opens With" file
+//! associations ([`assoc`]), which System Settings edits too.
+
+mod assoc;
+mod entry;
+mod tree;
+
+use std::cell::{Cell, RefCell};
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+
+use adw::prelude::*;
+use gtk::glib::clone;
+use gtk::glib::BoxedAnyObject;
+use gtk::{gio, glib};
+
+use entry::Entry;
+use webgen_registry::Registry;
+
+const APP_ID: &str = "com.webgen.Files";
+const FILES_NS: &str = "com.webgen.Files";
+
+type Reg = Option<Rc<Registry>>;
+
+fn show_hidden(reg: &Reg) -> bool {
+    reg.as_ref()
+        .map(|r| r.get_bool(FILES_NS, "show_hidden", false))
+        .unwrap_or(false)
+}
+
+fn main() -> glib::ExitCode {
+    let app = adw::Application::builder().application_id(APP_ID).build();
+    app.connect_activate(build_ui);
+    app.run()
+}
+
+fn build_ui(app: &adw::Application) {
+    let reg: Reg = Registry::open_default().ok().map(Rc::new);
+    if let Some(r) = &reg {
+        assoc::seed_defaults(r);
+    }
+
+    let start = glib::home_dir();
+    let current = Rc::new(RefCell::new(start.clone()));
+    let history = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
+    let forward = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
+    let clipboard = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
+    let query = Rc::new(RefCell::new(String::new()));
+    let recursive = Rc::new(Cell::new(false));
+
+    // ---- right-hand file list: ListStore<Entry> -> filter -> multi-selection -> ListView -------
+    let store = gio::ListStore::new::<BoxedAnyObject>();
+    let filter = gtk::CustomFilter::new(clone!(
+        #[strong] query,
+        #[strong] recursive,
+        move |obj| {
+            if recursive.get() {
+                return true; // recursive results are already only matches
+            }
+            let q = query.borrow().to_lowercase();
+            if q.is_empty() {
+                return true;
+            }
+            let b = obj.downcast_ref::<BoxedAnyObject>().unwrap();
+            let e = b.borrow::<Entry>();
+            e.name.to_lowercase().contains(&q)
+        }
+    ));
+    let filtered = gtk::FilterListModel::new(Some(store.clone()), Some(filter.clone()));
+    let selection = gtk::MultiSelection::new(Some(filtered));
+
+    let factory = gtk::SignalListItemFactory::new();
+    factory.connect_setup(|_, item| {
+        let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        row.set_margin_top(3);
+        row.set_margin_bottom(3);
+        let icon = gtk::Image::new();
+        icon.set_pixel_size(24);
+        let text = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let name = gtk::Label::new(None);
+        name.set_xalign(0.0);
+        name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        let sub = gtk::Label::new(None);
+        sub.set_xalign(0.0);
+        sub.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        sub.add_css_class("dim-label");
+        sub.add_css_class("caption");
+        text.append(&name);
+        text.append(&sub);
+        row.append(&icon);
+        row.append(&text);
+        item.set_child(Some(&row));
+    });
+    factory.connect_bind(|_, item| {
+        let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+        let b = item.item().and_downcast::<BoxedAnyObject>().unwrap();
+        let e = b.borrow::<Entry>();
+        let row = item.child().and_downcast::<gtk::Box>().unwrap();
+        let icon = row.first_child().and_downcast::<gtk::Image>().unwrap();
+        let text = row.last_child().and_downcast::<gtk::Box>().unwrap();
+        let name = text.first_child().and_downcast::<gtk::Label>().unwrap();
+        let sub = text.last_child().and_downcast::<gtk::Label>().unwrap();
+
+        match &e.icon {
+            Some(gicon) => icon.set_from_gicon(gicon),
+            None => icon.set_icon_name(Some(if e.is_dir { "folder" } else { "text-x-generic" })),
+        }
+        name.set_text(&e.name);
+        if e.subtitle.is_empty() {
+            sub.set_visible(false);
+        } else {
+            sub.set_visible(true);
+            sub.set_text(&e.subtitle);
+        }
+    });
+
+    let list = gtk::ListView::new(Some(selection.clone()), Some(factory));
+    list.add_css_class("navigation-sidebar");
+    let list_scroller = gtk::ScrolledWindow::new();
+    list_scroller.set_hexpand(true);
+    list_scroller.set_vexpand(true);
+    list_scroller.set_child(Some(&list));
+
+    // ---- header / toolbar widgets --------------------------------------------------------------
+    let btn_back = gtk::Button::from_icon_name("go-previous-symbolic");
+    btn_back.set_tooltip_text(Some("Back"));
+    let btn_forward = gtk::Button::from_icon_name("go-next-symbolic");
+    btn_forward.set_tooltip_text(Some("Forward"));
+    let btn_up = gtk::Button::from_icon_name("go-up-symbolic");
+    btn_up.set_tooltip_text(Some("Up"));
+    let btn_tree = gtk::ToggleButton::new();
+    btn_tree.set_icon_name("view-list-symbolic");
+    btn_tree.set_tooltip_text(Some("Show folder tree"));
+    btn_tree.set_active(true);
+
+    let path_entry = gtk::Entry::new();
+    path_entry.set_hexpand(true);
+    path_entry.set_primary_icon_name(Some("folder-symbolic"));
+
+    let btn_new = gtk::Button::from_icon_name("folder-new-symbolic");
+    btn_new.set_tooltip_text(Some("New Folder"));
+    let btn_copy = gtk::Button::from_icon_name("edit-copy-symbolic");
+    btn_copy.set_tooltip_text(Some("Copy"));
+    let btn_paste = gtk::Button::from_icon_name("edit-paste-symbolic");
+    btn_paste.set_tooltip_text(Some("Paste"));
+    let btn_openwith = gtk::Button::from_icon_name("emblem-system-symbolic");
+    btn_openwith.set_tooltip_text(Some("Open With…"));
+
+    let search = gtk::SearchEntry::new();
+    search.set_hexpand(true);
+    search.set_placeholder_text(Some("Filter this folder"));
+    let chk_recursive = gtk::CheckButton::with_label("Recursive");
+    chk_recursive.set_tooltip_text(Some("Search all subfolders below the current folder"));
+
+    let status = gtk::Label::new(None);
+    status.set_xalign(0.0);
+    status.add_css_class("dim-label");
+
+    // ---- reload: rebuild the file list for the current folder + query -------------------------
+    let reload: Rc<dyn Fn()> = {
+        let (store, current, reg, query, recursive) =
+            (store.clone(), current.clone(), reg.clone(), query.clone(), recursive.clone());
+        let (filter, path_entry, status) = (filter.clone(), path_entry.clone(), status.clone());
+        Rc::new(move || {
+            store.remove_all();
+            let dir = current.borrow().clone();
+            let hidden = show_hidden(&reg);
+            let q = query.borrow().clone();
+            let mut capped = false;
+            if recursive.get() && !q.trim().is_empty() {
+                let (entries, was_capped) = entry::search(&dir, q.trim(), hidden);
+                capped = was_capped;
+                for e in entries {
+                    store.append(&BoxedAnyObject::new(e));
+                }
+            } else {
+                for e in entry::list_dir(&dir, hidden) {
+                    store.append(&BoxedAnyObject::new(e));
+                }
+            }
+            filter.changed(gtk::FilterChange::Different);
+            path_entry.set_text(&dir.to_string_lossy());
+
+            let shown = if recursive.get() && !q.trim().is_empty() {
+                store.n_items()
+            } else {
+                // count what passes the substring filter
+                let ql = q.to_lowercase();
+                (0..store.n_items())
+                    .filter(|&i| {
+                        ql.is_empty()
+                            || store
+                                .item(i)
+                                .and_downcast::<BoxedAnyObject>()
+                                .map(|b| b.borrow::<Entry>().name.to_lowercase().contains(&ql))
+                                .unwrap_or(false)
+                    })
+                    .count() as u32
+            };
+            let noun = if shown == 1 { "item" } else { "items" };
+            status.set_text(&if recursive.get() && !q.trim().is_empty() {
+                format!("{shown} results{}", if capped { " (showing the first 2000)" } else { "" })
+            } else {
+                format!("{shown} {noun}")
+            });
+        })
+    };
+
+    // ---- navigate: change folder (records history) --------------------------------------------
+    let navigate: Rc<dyn Fn(PathBuf)> = {
+        let (current, history, forward, query, search, reload) = (
+            current.clone(),
+            history.clone(),
+            forward.clone(),
+            query.clone(),
+            search.clone(),
+            reload.clone(),
+        );
+        Rc::new(move |path: PathBuf| {
+            if !path.is_dir() {
+                return;
+            }
+            {
+                let mut cur = current.borrow_mut();
+                if *cur != path {
+                    history.borrow_mut().push(cur.clone());
+                    forward.borrow_mut().clear();
+                    *cur = path;
+                }
+            }
+            query.borrow_mut().clear();
+            search.set_text(""); // fires search handler (reload); explicit reload covers empty case
+            reload();
+        })
+    };
+
+    // ---- window (needed as dialog parent) ------------------------------------------------------
+    let tree_pane = tree::build(
+        show_hidden(&reg),
+        clone!(#[strong] navigate, move |p| navigate(p)),
+    );
+    let split = gtk::Paned::new(gtk::Orientation::Horizontal);
+    split.set_start_child(Some(&tree_pane));
+    split.set_end_child(Some(&list_scroller));
+    split.set_resize_start_child(false);
+    split.set_shrink_start_child(false);
+    split.set_position(240);
+
+    let header = adw::HeaderBar::new();
+    let nav_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    nav_box.add_css_class("linked");
+    nav_box.append(&btn_back);
+    nav_box.append(&btn_forward);
+    nav_box.append(&btn_up);
+    header.pack_start(&nav_box);
+    header.pack_start(&btn_tree);
+    header.set_title_widget(Some(&path_entry));
+    header.pack_end(&btn_new);
+    header.pack_end(&btn_openwith);
+    header.pack_end(&btn_paste);
+    header.pack_end(&btn_copy);
+
+    let search_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    search_bar.set_margin_start(8);
+    search_bar.set_margin_end(8);
+    search_bar.set_margin_top(6);
+    search_bar.set_margin_bottom(6);
+    search_bar.append(&search);
+    search_bar.append(&chk_recursive);
+
+    let bottom = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    bottom.set_margin_start(12);
+    bottom.set_margin_end(12);
+    bottom.set_margin_top(4);
+    bottom.set_margin_bottom(4);
+    bottom.append(&status);
+
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header);
+    toolbar.add_top_bar(&search_bar);
+    toolbar.set_content(Some(&split));
+    toolbar.add_bottom_bar(&bottom);
+
+    let window = adw::ApplicationWindow::builder()
+        .application(app)
+        .title("WebGen Files")
+        .default_width(1000)
+        .default_height(680)
+        .content(&toolbar)
+        .build();
+
+    // ---- wiring --------------------------------------------------------------------------------
+    btn_tree.connect_toggled(clone!(
+        #[weak] tree_pane,
+        move |b| tree_pane.set_visible(b.is_active())
+    ));
+
+    // Open on activate (double-click / Enter): folders navigate, files open via association.
+    list.connect_activate(clone!(
+        #[strong] selection,
+        #[strong] navigate,
+        #[strong] reg,
+        #[weak] window,
+        move |_lv, pos| {
+            if let Some(e) = item_at(&selection, pos) {
+                open_entry(&reg, &navigate, &window, &e);
+            }
+        }
+    ));
+
+    // Address bar: type a path + Enter to go there.
+    path_entry.connect_activate(clone!(
+        #[strong] navigate,
+        move |e| navigate(PathBuf::from(e.text().to_string()))
+    ));
+
+    // Live filter / search.
+    search.connect_search_changed(clone!(
+        #[strong] query,
+        #[strong] reload,
+        move |e| {
+            *query.borrow_mut() = e.text().to_string();
+            reload();
+        }
+    ));
+    chk_recursive.connect_toggled(clone!(
+        #[strong] recursive,
+        #[strong] reload,
+        move |c| {
+            recursive.set(c.is_active());
+            reload();
+        }
+    ));
+
+    btn_back.connect_clicked(clone!(
+        #[strong] current, #[strong] history, #[strong] forward, #[strong] reload,
+        move |_| {
+            if let Some(prev) = history.borrow_mut().pop() {
+                let mut cur = current.borrow_mut();
+                forward.borrow_mut().push(cur.clone());
+                *cur = prev;
+                drop(cur);
+                reload();
+            }
+        }
+    ));
+    btn_forward.connect_clicked(clone!(
+        #[strong] current, #[strong] history, #[strong] forward, #[strong] reload,
+        move |_| {
+            if let Some(next) = forward.borrow_mut().pop() {
+                let mut cur = current.borrow_mut();
+                history.borrow_mut().push(cur.clone());
+                *cur = next;
+                drop(cur);
+                reload();
+            }
+        }
+    ));
+    btn_up.connect_clicked(clone!(
+        #[strong] current, #[strong] navigate,
+        move |_| {
+            let parent = current.borrow().parent().map(Path::to_path_buf);
+            if let Some(p) = parent {
+                navigate(p);
+            }
+        }
+    ));
+
+    btn_new.connect_clicked(clone!(
+        #[strong] current, #[strong] reload, #[weak] window,
+        move |_| new_folder_dialog(&window, &current, &reload)
+    ));
+
+    btn_copy.connect_clicked(clone!(
+        #[strong] selection, #[strong] clipboard, #[strong] status,
+        move |_| {
+            let paths: Vec<PathBuf> = selected(&selection).into_iter().map(|e| e.path).collect();
+            if !paths.is_empty() {
+                let n = paths.len();
+                *clipboard.borrow_mut() = paths;
+                status.set_text(&format!("Copied {n} item{}", if n == 1 { "" } else { "s" }));
+            }
+        }
+    ));
+    btn_paste.connect_clicked(clone!(
+        #[strong] current, #[strong] clipboard, #[strong] reload, #[strong] status,
+        move |_| {
+            let dest = current.borrow().clone();
+            let items = clipboard.borrow().clone();
+            let mut ok = 0;
+            for src in &items {
+                if entry::copy_into(src, &dest).is_ok() {
+                    ok += 1;
+                }
+            }
+            if ok > 0 {
+                reload();
+                status.set_text(&format!("Pasted {ok} item{}", if ok == 1 { "" } else { "s" }));
+            }
+        }
+    ));
+    btn_openwith.connect_clicked(clone!(
+        #[strong] selection, #[strong] reg, #[weak] window,
+        move |_| {
+            if let Some(e) = selected(&selection).into_iter().find(|e| !e.is_dir) {
+                open_with_dialog(&reg, &window, &e);
+            }
+        }
+    ));
+
+    reload();
+    window.present();
+}
+
+/// The entry at a model position in the selection.
+fn item_at(selection: &gtk::MultiSelection, pos: u32) -> Option<Entry> {
+    selection
+        .item(pos)
+        .and_downcast::<BoxedAnyObject>()
+        .map(|b| b.borrow::<Entry>().clone())
+}
+
+/// All currently-selected entries.
+fn selected(selection: &gtk::MultiSelection) -> Vec<Entry> {
+    let bitset = selection.selection();
+    let mut out = Vec::new();
+    for i in 0..bitset.size() {
+        let pos = bitset.nth(i as u32);
+        if let Some(e) = item_at(selection, pos) {
+            out.push(e);
+        }
+    }
+    out
+}
+
+/// Open a file (or navigate into a folder). Files use the shared association, then the system
+/// default; if neither works, the user is asked to choose.
+fn open_entry(reg: &Reg, navigate: &Rc<dyn Fn(PathBuf)>, window: &adw::ApplicationWindow, e: &Entry) {
+    if e.is_dir {
+        navigate(e.path.clone());
+        return;
+    }
+    if let (Some(r), Some(ext)) = (reg, assoc::extension_of(&e.name)) {
+        if let Some(cmd) = assoc::program_for(r, &ext) {
+            launch(&cmd, &e.path);
+            return;
+        }
+    }
+    let uri = gio::File::for_path(&e.path).uri();
+    if gio::AppInfo::launch_default_for_uri(&uri, gio::AppLaunchContext::NONE).is_err() {
+        open_with_dialog(reg, window, e);
+    }
+}
+
+/// Spawn `command <path>`, detached — the file manager doesn't wait on it.
+fn launch(command: &str, path: &Path) {
+    let _ = std::process::Command::new(command).arg(path).spawn();
+}
+
+/// Prompt for a folder name, then create it in `dir`.
+fn new_folder_dialog(window: &adw::ApplicationWindow, dir: &Rc<RefCell<PathBuf>>, reload: &Rc<dyn Fn()>) {
+    let dialog = adw::MessageDialog::new(Some(window), Some("New Folder"), None);
+    let entry = gtk::Entry::new();
+    entry.set_placeholder_text(Some("Folder name"));
+    entry.set_activates_default(true);
+    dialog.set_extra_child(Some(&entry));
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("create", "Create");
+    dialog.set_response_appearance("create", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("create"));
+    dialog.set_close_response("cancel");
+    dialog.connect_response(
+        None,
+        clone!(
+            #[strong] dir,
+            #[strong] reload,
+            move |_, resp| {
+                if resp == "create" {
+                    let name = entry.text().to_string();
+                    let name = name.trim();
+                    if !name.is_empty() {
+                        let _ = std::fs::create_dir(dir.borrow().join(name));
+                        reload();
+                    }
+                }
+            }
+        ),
+    );
+    dialog.present();
+}
+
+/// Choose a program to open a file with, optionally remembering it for the extension.
+fn open_with_dialog(reg: &Reg, window: &adw::ApplicationWindow, e: &Entry) {
+    let win = gtk::Window::builder()
+        .title("Open With")
+        .transient_for(window)
+        .modal(true)
+        .default_width(360)
+        .build();
+
+    let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.set_margin_top(16);
+    content.set_margin_bottom(16);
+    content.set_margin_start(16);
+    content.set_margin_end(16);
+
+    let heading = gtk::Label::new(None);
+    heading.set_xalign(0.0);
+    heading.set_markup(&format!("Open <b>{}</b> with:", glib::markup_escape_text(&e.name)));
+    content.append(&heading);
+
+    let listbox = gtk::ListBox::new();
+    listbox.set_selection_mode(gtk::SelectionMode::Single);
+    listbox.add_css_class("boxed-list");
+    for p in assoc::PROGRAMS {
+        let row = adw::ActionRow::new();
+        row.set_title(p.name);
+        row.set_subtitle(p.command);
+        let img = gtk::Image::from_icon_name(p.icon);
+        img.set_pixel_size(24);
+        row.add_prefix(&img);
+        listbox.append(&row);
+    }
+    listbox.select_row(listbox.row_at_index(0).as_ref());
+    content.append(&listbox);
+
+    let ext = assoc::extension_of(&e.name);
+    let remember = gtk::CheckButton::with_label(&match &ext {
+        Some(x) => format!("Always open .{x} files this way"),
+        None => "Remember for this file type".to_string(),
+    });
+    remember.set_sensitive(ext.is_some());
+    content.append(&remember);
+
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    buttons.set_halign(gtk::Align::End);
+    let cancel = gtk::Button::with_label("Cancel");
+    let open = gtk::Button::with_label("Open");
+    open.add_css_class("suggested-action");
+    buttons.append(&cancel);
+    buttons.append(&open);
+    content.append(&buttons);
+
+    outer.append(&content);
+    win.set_child(Some(&outer));
+
+    cancel.connect_clicked(clone!(#[weak] win, move |_| win.close()));
+    let path = e.path.clone();
+    open.connect_clicked(clone!(
+        #[weak] win,
+        #[strong] reg,
+        #[strong] remember,
+        #[strong] listbox,
+        move |_| {
+            let idx = listbox.selected_row().map(|r| r.index()).unwrap_or(0).max(0) as usize;
+            if let Some(p) = assoc::PROGRAMS.get(idx) {
+                launch(p.command, &path);
+                if remember.is_active() {
+                    if let (Some(r), Some(x)) = (&reg, &ext) {
+                        assoc::set_program(r, x, p.command);
+                    }
+                }
+            }
+            win.close();
+        }
+    ));
+
+    win.present();
+}
