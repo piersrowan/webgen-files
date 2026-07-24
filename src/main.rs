@@ -112,7 +112,14 @@ fn build_ui(app: &adw::Application) {
             let gesture = gtk::GestureClick::new();
             gesture.set_button(gdk::BUTTON_SECONDARY);
             let li = item.clone();
-            gesture.connect_pressed(clone!(
+            // Open on RELEASE, synchronously. Two Wayland lessons the hard way: (1) opening on PRESS
+            // let the following RELEASE dismiss the menu before it showed; (2) deferring to an idle
+            // callback fixed that but the popover then had no valid input grab, so clicking a menu
+            // item only dismissed it without ever activating the action. Opening inside the RELEASE
+            // handler gives the popup a proper grab (from that event's serial) AND has no later event
+            // to dismiss it. Anchor to the always-mapped ListView — the clicked row can be recycled
+            // by the selection below, and on Wayland a popup on a gone parent silently fails to map.
+            gesture.connect_released(clone!(
                 #[weak] row,
                 #[weak] selection,
                 #[strong] menu_opener,
@@ -121,23 +128,13 @@ fn build_ui(app: &adw::Application) {
                     if pos != gtk::INVALID_LIST_POSITION && !selection.is_selected(pos) {
                         selection.select_item(pos, true);
                     }
-                    // Anchor the menu to the *ListView*, not this row: selecting the item above can
-                    // re-render and unparent the clicked row, and on Wayland an xdg-popup whose
-                    // parent surface has gone silently fails to map (the menu never appears). The
-                    // ListView is always mapped. Translate the click into its coordinate space so
-                    // the menu still points at the cursor.
                     let anchor = row
                         .ancestor(gtk::ListView::static_type())
                         .unwrap_or_else(|| row.clone().upcast::<gtk::Widget>());
                     let (ax, ay) = row.translate_coordinates(&anchor, x, y).unwrap_or((x, y));
-                    // Defer the popup to idle: popping up synchronously inside the button-PRESS
-                    // handler lets the following RELEASE dismiss it before it shows.
-                    let opener = menu_opener.clone();
-                    glib::idle_add_local_once(move || {
-                        if let Some(open) = opener.borrow().as_ref() {
-                            open(anchor, ax, ay);
-                        }
-                    });
+                    if let Some(open) = menu_opener.borrow().as_ref() {
+                        open(anchor, ax, ay);
+                    }
                 }
             ));
             row.add_controller(gesture);
@@ -568,7 +565,14 @@ fn build_ui(app: &adw::Application) {
             popover.insert_action_group("files", Some(&actions));
             popover.set_has_arrow(false);
             popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-            popover.connect_closed(|p| p.unparent());
+            // Defer the unparent to idle. Activating a menu item first CLOSES the popover, then
+            // activates its action; unparenting synchronously in ::closed tears down the widget's
+            // action muxer BEFORE the action is looked up, so the item silently does nothing.
+            // Unparenting on the next idle lets the action fire first (then cleans up, no warning).
+            popover.connect_closed(|p| {
+                let p = p.clone();
+                glib::idle_add_local_once(move || p.unparent());
+            });
             popover.popup();
         }
     )));
