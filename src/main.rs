@@ -54,6 +54,8 @@ fn build_ui(app: &adw::Application) {
     let history = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
     let forward = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
     let clipboard = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
+    // true = the clipboard holds a "cut" (paste moves); false = a "copy" (paste copies).
+    let cut_mode = Rc::new(Cell::new(false));
     let query = Rc::new(RefCell::new(String::new()));
     let recursive = Rc::new(Cell::new(false));
 
@@ -349,35 +351,125 @@ fn build_ui(app: &adw::Application) {
         }
     ));
     mk("copy").connect_activate(clone!(
-        #[strong] selection, #[strong] clipboard, #[strong] status,
+        #[strong] selection, #[strong] clipboard, #[strong] cut_mode, #[strong] status,
         move |_, _| {
             let paths: Vec<PathBuf> = selected(&selection).into_iter().map(|e| e.path).collect();
             if !paths.is_empty() {
                 let n = paths.len();
                 *clipboard.borrow_mut() = paths;
+                cut_mode.set(false);
                 status.set_text(&format!("Copied {n} item{}", if n == 1 { "" } else { "s" }));
             }
         }
     ));
+    mk("cut").connect_activate(clone!(
+        #[strong] selection, #[strong] clipboard, #[strong] cut_mode, #[strong] status,
+        move |_, _| {
+            let paths: Vec<PathBuf> = selected(&selection).into_iter().map(|e| e.path).collect();
+            if !paths.is_empty() {
+                let n = paths.len();
+                *clipboard.borrow_mut() = paths;
+                cut_mode.set(true);
+                status.set_text(&format!("Cut {n} item{}", if n == 1 { "" } else { "s" }));
+            }
+        }
+    ));
+    mk("copy-path").connect_activate(clone!(
+        #[strong] selection, #[weak] window, #[strong] status,
+        move |_, _| {
+            let paths: Vec<String> =
+                selected(&selection).iter().map(|e| e.path.to_string_lossy().to_string()).collect();
+            if !paths.is_empty() {
+                window.clipboard().set_text(&paths.join("\n"));
+                status.set_text(if paths.len() == 1 { "Path copied" } else { "Paths copied" });
+            }
+        }
+    ));
     mk("paste").connect_activate(clone!(
-        #[strong] current, #[strong] clipboard, #[strong] reload, #[strong] status, #[weak] window,
+        #[strong] current, #[strong] clipboard, #[strong] cut_mode, #[strong] reload, #[strong] status, #[weak] window,
         move |_, _| {
             let dest = current.borrow().clone();
             let items = clipboard.borrow().clone();
+            let moving = cut_mode.get();
             let mut ok = 0;
             for src in &items {
-                match entry::copy_into(src, &dest) {
+                let r = if moving { entry::move_into(src, &dest) } else { entry::copy_into(src, &dest) };
+                if let Err(e) = r {
+                    error_dialog(&window, &format!("Couldn't paste “{}”", src.display()), &e.to_string());
+                    break;
+                }
+                ok += 1;
+            }
+            if moving {
+                clipboard.borrow_mut().clear();
+                cut_mode.set(false);
+            }
+            if ok > 0 {
+                reload();
+                let verb = if moving { "Moved" } else { "Pasted" };
+                status.set_text(&format!("{verb} {ok} item{}", if ok == 1 { "" } else { "s" }));
+            }
+        }
+    ));
+    // Compress / Extract — kept as handles so the right-click menu can grey out the inapplicable one.
+    let a_compress = mk("compress");
+    a_compress.connect_activate(clone!(
+        #[strong] selection, #[strong] current, #[strong] reload, #[strong] status, #[weak] window,
+        move |_, _| {
+            let items = selected(&selection);
+            let dir = current.borrow().clone();
+            match run_compress(&dir, &items) {
+                Ok(archive) => {
+                    reload();
+                    let name = archive.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    status.set_text(&format!("Created {name}"));
+                }
+                Err(e) => error_dialog(&window, "Couldn't create archive", &e),
+            }
+        }
+    ));
+    let a_extract = mk("extract");
+    a_extract.connect_activate(clone!(
+        #[strong] selection, #[strong] current, #[strong] reload, #[strong] status, #[weak] window,
+        move |_, _| {
+            let dir = current.borrow().clone();
+            let archives: Vec<Entry> = selected(&selection)
+                .into_iter()
+                .filter(|e| !e.is_dir && entry::is_archive(&e.name))
+                .collect();
+            if archives.is_empty() {
+                return;
+            }
+            let mut ok = 0;
+            let mut err = None;
+            for a in &archives {
+                match run_extract(&dir, a) {
                     Ok(_) => ok += 1,
                     Err(e) => {
-                        error_dialog(&window, &format!("Couldn't paste “{}”", src.display()), &e.to_string());
+                        err = Some((a.name.clone(), e));
                         break;
                     }
                 }
             }
             if ok > 0 {
                 reload();
-                status.set_text(&format!("Pasted {ok} item{}", if ok == 1 { "" } else { "s" }));
+                status.set_text(&format!("Extracted {ok} archive{}", if ok == 1 { "" } else { "s" }));
             }
+            if let Some((name, e)) = err {
+                error_dialog(&window, &format!("Couldn't extract “{name}”"), &e);
+            }
+        }
+    ));
+    mk("open-terminal").connect_activate(clone!(
+        #[strong] selection, #[strong] current,
+        move |_, _| {
+            // Open in the selected folder if one is chosen, else the current folder.
+            let dir = selected(&selection)
+                .into_iter()
+                .find(|e| e.is_dir)
+                .map(|e| e.path)
+                .unwrap_or_else(|| current.borrow().clone());
+            let _ = std::process::Command::new("webgen-terminal").current_dir(&dir).spawn();
         }
     ));
     mk("new-folder").connect_activate(clone!(
@@ -418,15 +510,22 @@ fn build_ui(app: &adw::Application) {
     let sec_open = gio::Menu::new();
     sec_open.append(Some("Open"), Some("files.open"));
     sec_open.append(Some("Open With…"), Some("files.open-with"));
+    sec_open.append(Some("Open Terminal Here"), Some("files.open-terminal"));
     menu.append_section(None, &sec_open);
     let sec_new = gio::Menu::new();
     sec_new.append(Some("New File"), Some("files.new-file"));
     sec_new.append(Some("New Folder"), Some("files.new-folder"));
     menu.append_section(None, &sec_new);
     let sec_clip = gio::Menu::new();
+    sec_clip.append(Some("Cut"), Some("files.cut"));
     sec_clip.append(Some("Copy"), Some("files.copy"));
     sec_clip.append(Some("Paste"), Some("files.paste"));
+    sec_clip.append(Some("Copy Path"), Some("files.copy-path"));
     menu.append_section(None, &sec_clip);
+    let sec_arch = gio::Menu::new();
+    sec_arch.append(Some("Compress"), Some("files.compress"));
+    sec_arch.append(Some("Extract Here"), Some("files.extract"));
+    menu.append_section(None, &sec_arch);
     let sec_meta = gio::Menu::new();
     sec_meta.append(Some("Rename"), Some("files.rename"));
     sec_meta.append(Some("Info"), Some("files.info"));
@@ -436,7 +535,16 @@ fn build_ui(app: &adw::Application) {
     menu.append_section(None, &sec_del);
     *menu_opener.borrow_mut() = Some(Rc::new(clone!(
         #[strong] menu,
+        #[strong] selection,
+        #[strong] a_compress,
+        #[strong] a_extract,
         move |anchor: gtk::Widget, x: f64, y: f64| {
+            // Grey out Compress vs Extract: Extract is offered only when EVERY selected item is an
+            // archive; Compress when there's a non-archive selection. (One of them is always dimmed.)
+            let sel = selected(&selection);
+            let all_archives = !sel.is_empty() && sel.iter().all(|e| !e.is_dir && entry::is_archive(&e.name));
+            a_extract.set_enabled(all_archives);
+            a_compress.set_enabled(!sel.is_empty() && !all_archives);
             let popover = gtk::PopoverMenu::from_model(Some(&menu));
             popover.set_parent(&anchor);
             popover.set_has_arrow(false);
@@ -459,6 +567,18 @@ fn build_ui(app: &adw::Application) {
             match keyval {
                 gdk::Key::n | gdk::Key::N if ctrl => {
                     act("files.new-file");
+                    glib::Propagation::Stop
+                }
+                gdk::Key::c | gdk::Key::C if ctrl => {
+                    act("files.copy");
+                    glib::Propagation::Stop
+                }
+                gdk::Key::x | gdk::Key::X if ctrl => {
+                    act("files.cut");
+                    glib::Propagation::Stop
+                }
+                gdk::Key::v | gdk::Key::V if ctrl => {
+                    act("files.paste");
                     glib::Propagation::Stop
                 }
                 gdk::Key::Delete => {
@@ -605,6 +725,77 @@ fn open_entry(reg: &Reg, navigate: &Rc<dyn Fn(PathBuf)>, window: &adw::Applicati
 /// Spawn `command <path>`, detached — the file manager doesn't wait on it.
 fn launch(command: &str, path: &Path) {
     let _ = std::process::Command::new(command).arg(path).spawn();
+}
+
+/// Compress the selected items into a new `.zip` in `dir` (via Info-ZIP `zip`). Names the archive
+/// after the single item, or "Archive" for several; never clobbers. Returns the archive path.
+fn run_compress(dir: &Path, items: &[Entry]) -> Result<PathBuf, String> {
+    if items.is_empty() {
+        return Err("Nothing selected to compress.".into());
+    }
+    let base = if items.len() == 1 {
+        Path::new(&items[0].name)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| items[0].name.clone())
+    } else {
+        "Archive".to_string()
+    };
+    let mut archive = dir.join(format!("{base}.zip"));
+    let mut n = 1;
+    while archive.exists() {
+        archive = dir.join(format!("{base} ({n}).zip"));
+        n += 1;
+    }
+    // `zip -r -q <archive> name...` with cwd=dir, so the archive stores relative names.
+    let mut cmd = std::process::Command::new("zip");
+    cmd.arg("-r").arg("-q").arg(&archive).current_dir(dir);
+    for e in items {
+        cmd.arg(&e.name);
+    }
+    match cmd.status() {
+        Ok(s) if s.success() => Ok(archive),
+        Ok(s) => Err(format!("zip exited with {s} (is `zip` installed?)")),
+        Err(e) => Err(format!("couldn't run zip: {e}")),
+    }
+}
+
+/// Extract `archive` into a fresh subfolder of `dir` (via `bsdtar`, which reads zip/tar/gz/xz/7z/…).
+fn run_extract(dir: &Path, archive: &Entry) -> Result<PathBuf, String> {
+    // Folder name = the archive without its extension(s), e.g. "foo.tar.gz" -> "foo".
+    let mut stem = Path::new(&archive.name)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| archive.name.clone());
+    if let Some(s) = stem.strip_suffix(".tar") {
+        stem = s.to_string();
+    }
+    let mut out = dir.join(&stem);
+    let mut n = 1;
+    while out.exists() {
+        out = dir.join(format!("{stem} ({n})"));
+        n += 1;
+    }
+    std::fs::create_dir(&out).map_err(|e| e.to_string())?;
+    let status = std::process::Command::new("bsdtar")
+        .arg("-x")
+        .arg("-f")
+        .arg(&archive.path)
+        .arg("-C")
+        .arg(&out)
+        .status();
+    match status {
+        Ok(s) if s.success() => Ok(out),
+        Ok(s) => {
+            let _ = std::fs::remove_dir_all(&out);
+            Err(format!("bsdtar exited with {s}"))
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&out);
+            Err(format!("couldn't run bsdtar: {e}"))
+        }
+    }
 }
 
 /// A small error alert. Used whenever a filesystem op fails (e.g. permission denied).
@@ -796,6 +987,9 @@ fn info_dialog(window: &adw::ApplicationWindow, item: &Entry) {
     add("Permissions", &format!("{}  ({})", info.perms_octal, info.perms_rwx));
     add("Owner", &info.owner);
     add("Group", &info.group);
+    add("Modified", &info.modified);
+    add("Accessed", &info.accessed);
+    add("Created", &info.created);
     dialog.set_extra_child(Some(&list));
     dialog.add_response("close", "Close");
     dialog.set_default_response(Some("close"));

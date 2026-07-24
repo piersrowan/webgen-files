@@ -1,7 +1,10 @@
-//! File metadata for the "Info" dialog: size, permissions (octal + rwx), and owner/group names.
+//! File metadata for the "Info" dialog: size, permissions (octal + rwx), owner/group, and dates.
 
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::time::UNIX_EPOCH;
+
+use gtk::glib;
 
 pub struct Info {
     pub name: String,
@@ -12,6 +15,9 @@ pub struct Info {
     pub perms_rwx: String,
     pub owner: String,
     pub group: String,
+    pub modified: String,
+    pub accessed: String,
+    pub created: String,
 }
 
 /// Gather info for `path`. Uses `symlink_metadata` so a symlink reports its own type/perms rather
@@ -56,7 +62,25 @@ pub fn gather(path: &Path) -> std::io::Result<Info> {
         perms_rwx: mode_to_rwx(mode),
         owner: resolve(md.uid(), "/etc/passwd"),
         group: resolve(md.gid(), "/etc/group"),
+        modified: fmt_time(md.mtime()),
+        accessed: fmt_time(md.atime()),
+        // Birth time isn't available on every filesystem; show "—" when it isn't.
+        created: md
+            .created()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| fmt_time(d.as_secs() as i64))
+            .unwrap_or_else(|| "—".to_string()),
     })
+}
+
+/// Format a Unix timestamp as local `YYYY-MM-DD HH:MM`.
+fn fmt_time(secs: i64) -> String {
+    glib::DateTime::from_unix_local(secs)
+        .ok()
+        .and_then(|d| d.format("%Y-%m-%d %H:%M").ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "—".to_string())
 }
 
 fn human_size(bytes: u64) -> String {

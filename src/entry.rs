@@ -117,21 +117,36 @@ fn sort(entries: &mut [Entry]) {
 /// Copy `src` into directory `dest_dir`, recursing into folders and avoiding clobbering an existing
 /// name (appends " (copy)"). Returns the created path, or an io error.
 pub fn copy_into(src: &Path, dest_dir: &Path) -> std::io::Result<PathBuf> {
-    let base = src
-        .file_name()
-        .map(|n| n.to_os_string())
-        .unwrap_or_default();
-    let mut target = dest_dir.join(&base);
-    // Never overwrite; pick a free "name (copy)" / "name (copy 2)" ...
+    let base = src.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    let target = free_target(dest_dir, &base);
+    copy_recursive(src, &target)?;
+    Ok(target)
+}
+
+/// Move `src` into `dest_dir` (used by cut+paste). Fast `rename` within a filesystem, falling back to
+/// copy-then-delete across devices. Non-clobbering, and a no-op if `src` is already in `dest_dir`.
+pub fn move_into(src: &Path, dest_dir: &Path) -> std::io::Result<PathBuf> {
+    if src.parent() == Some(dest_dir) {
+        return Ok(src.to_path_buf());
+    }
+    let base = src.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    let target = free_target(dest_dir, &base);
+    match std::fs::rename(src, &target) {
+        Ok(()) => Ok(target),
+        Err(_) => {
+            copy_recursive(src, &target)?;
+            remove_path(src)?;
+            Ok(target)
+        }
+    }
+}
+
+/// A non-clobbering path in `dest_dir` for name `base`: appends " (copy)" / " (copy N)" if taken.
+fn free_target(dest_dir: &Path, base: &std::ffi::OsStr) -> PathBuf {
+    let mut target = dest_dir.join(base);
     if target.exists() {
-        let stem = Path::new(&base)
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let ext = Path::new(&base)
-            .extension()
-            .map(|e| format!(".{}", e.to_string_lossy()))
-            .unwrap_or_default();
+        let stem = Path::new(base).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let ext = Path::new(base).extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
         let mut n = 1;
         loop {
             let suffix = if n == 1 { " (copy)".to_string() } else { format!(" (copy {})", n) };
@@ -143,8 +158,19 @@ pub fn copy_into(src: &Path, dest_dir: &Path) -> std::io::Result<PathBuf> {
             n += 1;
         }
     }
-    copy_recursive(src, &target)?;
-    Ok(target)
+    target
+}
+
+/// Whether `name` looks like an archive we can extract (by extension). Used to grey out Compress vs
+/// Extract in the right-click menu; the actual extraction is `bsdtar`, which reads all of these.
+pub fn is_archive(name: &str) -> bool {
+    let l = name.to_lowercase();
+    const MULTI: &[&str] = &[".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".tar.lz", ".tar.lzma"];
+    const EXACT: &[&str] = &[
+        ".zip", ".tar", ".tgz", ".tbz", ".tbz2", ".txz", ".tzst", ".7z", ".rar", ".jar", ".cbz",
+        ".gz", ".bz2", ".xz", ".zst", ".lz", ".cpio", ".iso",
+    ];
+    MULTI.iter().any(|e| l.ends_with(e)) || EXACT.iter().any(|e| l.ends_with(e))
 }
 
 /// Delete `path`, recursively for a directory. A symlink is unlinked (never followed), so deleting
