@@ -536,6 +536,7 @@ fn build_ui(app: &adw::Application) {
     *menu_opener.borrow_mut() = Some(Rc::new(clone!(
         #[strong] menu,
         #[strong] selection,
+        #[strong] actions,
         #[strong] a_compress,
         #[strong] a_extract,
         move |anchor: gtk::Widget, x: f64, y: f64| {
@@ -547,6 +548,11 @@ fn build_ui(app: &adw::Application) {
             a_compress.set_enabled(!sel.is_empty() && !all_archives);
             let popover = gtk::PopoverMenu::from_model(Some(&menu));
             popover.set_parent(&anchor);
+            // Attach the "files" action group to the popover itself: a PopoverMenu parented to a
+            // (recycled) ListView row does NOT reliably resolve the group that lives up on the
+            // window, so every menu item would silently do nothing. Inserting it here guarantees
+            // `files.*` resolves regardless of the muxer chain.
+            popover.insert_action_group("files", Some(&actions));
             popover.set_has_arrow(false);
             popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
             popover.connect_closed(|p| p.unparent());
