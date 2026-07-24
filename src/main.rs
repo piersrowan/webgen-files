@@ -121,9 +121,17 @@ fn build_ui(app: &adw::Application) {
                     if pos != gtk::INVALID_LIST_POSITION && !selection.is_selected(pos) {
                         selection.select_item(pos, true);
                     }
-                    if let Some(open) = menu_opener.borrow().as_ref() {
-                        open(row.upcast::<gtk::Widget>(), x, y);
-                    }
+                    // Defer the popup to the next main-loop idle. Popping the menu up synchronously
+                    // inside the button-PRESS handler lets the following button-RELEASE dismiss it,
+                    // so the menu flashes/never appears. Opening it once the click sequence has
+                    // settled makes it stick. (This — not action resolution — was the dead menu.)
+                    let opener = menu_opener.clone();
+                    let anchor = row.clone();
+                    glib::idle_add_local_once(move || {
+                        if let Some(open) = opener.borrow().as_ref() {
+                            open(anchor.upcast::<gtk::Widget>(), x, y);
+                        }
+                    });
                 }
             ));
             row.add_controller(gesture);
@@ -548,10 +556,9 @@ fn build_ui(app: &adw::Application) {
             a_compress.set_enabled(!sel.is_empty() && !all_archives);
             let popover = gtk::PopoverMenu::from_model(Some(&menu));
             popover.set_parent(&anchor);
-            // Attach the "files" action group to the popover itself: a PopoverMenu parented to a
-            // (recycled) ListView row does NOT reliably resolve the group that lives up on the
-            // window, so every menu item would silently do nothing. Inserting it here guarantees
-            // `files.*` resolves regardless of the muxer chain.
+            // Defensive: also attach the "files" group to the popover so items resolve even if the
+            // muxer chain from a (recycled) ListView row up to the window is ever interrupted across
+            // GTK versions. (Window-level resolution works on its own here — this is belt-and-braces.)
             popover.insert_action_group("files", Some(&actions));
             popover.set_has_arrow(false);
             popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
