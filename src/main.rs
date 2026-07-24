@@ -121,15 +121,21 @@ fn build_ui(app: &adw::Application) {
                     if pos != gtk::INVALID_LIST_POSITION && !selection.is_selected(pos) {
                         selection.select_item(pos, true);
                     }
-                    // Defer the popup to the next main-loop idle. Popping the menu up synchronously
-                    // inside the button-PRESS handler lets the following button-RELEASE dismiss it,
-                    // so the menu flashes/never appears. Opening it once the click sequence has
-                    // settled makes it stick. (This — not action resolution — was the dead menu.)
+                    // Anchor the menu to the *ListView*, not this row: selecting the item above can
+                    // re-render and unparent the clicked row, and on Wayland an xdg-popup whose
+                    // parent surface has gone silently fails to map (the menu never appears). The
+                    // ListView is always mapped. Translate the click into its coordinate space so
+                    // the menu still points at the cursor.
+                    let anchor = row
+                        .ancestor(gtk::ListView::static_type())
+                        .unwrap_or_else(|| row.clone().upcast::<gtk::Widget>());
+                    let (ax, ay) = row.translate_coordinates(&anchor, x, y).unwrap_or((x, y));
+                    // Defer the popup to idle: popping up synchronously inside the button-PRESS
+                    // handler lets the following RELEASE dismiss it before it shows.
                     let opener = menu_opener.clone();
-                    let anchor = row.clone();
                     glib::idle_add_local_once(move || {
                         if let Some(open) = opener.borrow().as_ref() {
-                            open(anchor.upcast::<gtk::Widget>(), x, y);
+                            open(anchor, ax, ay);
                         }
                     });
                 }
