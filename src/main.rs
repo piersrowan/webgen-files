@@ -332,7 +332,7 @@ fn build_ui(app: &adw::Application) {
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .title("WebGen Files")
+        .title("Files")
         .default_width(1000)
         .default_height(680)
         .content(&toolbar)

@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Version=1.0
-Name=WebGen Files
+Name=Files
 GenericName=File Manager
 Comment=Browse, search, and open your files and folders
 # %F lets other apps hand folders to open; the binary is `webgen-files`.
