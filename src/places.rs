@@ -185,6 +185,11 @@ pub fn icon_for(place: &Place) -> &'static str {
     }
 }
 
+/// Same as [`unescape`], for callers outside this module (mounts.rs compares mount points).
+pub fn unescape_public(s: &str) -> String {
+    unescape(s)
+}
+
 /// `/proc/mounts` escapes space, tab, newline and backslash as octal.
 fn unescape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -346,10 +351,16 @@ pub fn build(
     // expander state and flicker, so the widget tree is only rebuilt when what is mounted
     // actually changes.
     let last = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+    // Lets the rebuild closure call itself after a connect/disconnect.
+    #[allow(clippy::type_complexity)]
+    let rebuild_ref: std::rc::Rc<std::cell::RefCell<Option<std::rc::Rc<dyn Fn()>>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
 
     let rebuild: std::rc::Rc<dyn Fn()> = {
         let container = container.clone();
         let last = last.clone();
+        let rebuild_ref = rebuild_ref.clone();
+        let reg = reg.clone();
         std::rc::Rc::new(move || {
             let all = places();
             let fingerprint = all
@@ -393,12 +404,46 @@ pub fn build(
             if !drives.is_empty() {
                 container.append(&heading("Devices"));
                 for d in &drives {
-                    container.append(&place_row(d, on_navigate.clone()));
+                    if d.kind == Kind::Removable {
+                        let r = rebuild_ref.clone();
+                        let after: std::rc::Rc<dyn Fn()> = std::rc::Rc::new(move || {
+                            if let Some(f) = r.borrow().as_ref() { f(); }
+                        });
+                        container.append(&mounted_row(d, on_navigate.clone(), after));
+                    } else {
+                        container.append(&place_row(d, on_navigate.clone()));
+                    }
                 }
             }
 
+            // Network heading carries the add-connection action.
+            let net_head = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            let h = heading("Network");
+            h.set_hexpand(true);
+            net_head.append(&h);
+            let add = gtk::Button::from_icon_name("list-add-symbolic");
+            add.add_css_class("flat");
+            add.set_valign(gtk::Align::End);
+            add.set_tooltip_text(Some("Connect to a server"));
+            add.set_margin_end(6);
+            {
+                let (reg, rebuild_again) = (reg.clone(), rebuild_ref.clone());
+                add.connect_clicked(move |b| {
+                    let after: std::rc::Rc<dyn Fn()> = {
+                        let r = rebuild_again.clone();
+                        std::rc::Rc::new(move || {
+                            if let Some(f) = r.borrow().as_ref() {
+                                f();
+                            }
+                        })
+                    };
+                    add_mount_dialog(b.root().and_downcast::<gtk::Window>().as_ref(), reg.clone(), after);
+                });
+            }
+            net_head.append(&add);
+            container.append(&net_head);
+
             if !hosts.is_empty() {
-                container.append(&heading("Network"));
                 for (host, display, mounts) in &hosts {
                     container.append(&host_row(
                         host,
@@ -406,11 +451,36 @@ pub fn build(
                         mounts,
                         reg.clone(),
                         on_navigate.clone(),
+                        {
+                            let r = rebuild_ref.clone();
+                            std::rc::Rc::new(move || {
+                                if let Some(f) = r.borrow().as_ref() { f(); }
+                            })
+                        },
                     ));
+                }
+            }
+
+            // Saved connections that are not currently mounted, so they can be reconnected.
+            // Whether something is mounted is read from the kernel, never remembered.
+            let after: std::rc::Rc<dyn Fn()> = {
+                let r = rebuild_ref.clone();
+                std::rc::Rc::new(move || {
+                    if let Some(f) = r.borrow().as_ref() {
+                        f();
+                    }
+                })
+            };
+            for def in crate::mounts::load(&reg) {
+                if !crate::mounts::is_connected(&def) {
+                    container.append(&saved_row(&def, reg.clone(), after.clone()));
                 }
             }
         })
     };
+    // The rebuild closure needs to call itself (after connecting, the list must refresh), which
+    // it cannot capture directly -- so it reaches itself through this cell.
+    *rebuild_ref.borrow_mut() = Some(rebuild.clone());
 
     rebuild();
     (container, rebuild)
@@ -425,6 +495,58 @@ fn heading(text: &str) -> gtk::Label {
     l.set_margin_top(10);
     l.set_margin_bottom(2);
     l
+}
+
+/// The right way to unmount a given filesystem.
+///
+/// FUSE mounts (sshfs) must go through `fusermount3` -- plain `umount` fails for an ordinary
+/// user. Everything else uses `umount`, which needs root.
+fn umount_argv_for(p: &Place) -> (Vec<String>, bool) {
+    let target = p.path.to_string_lossy().into_owned();
+    if p.fstype.starts_with("fuse.") || p.fstype == "sshfs" {
+        (vec!["fusermount3".into(), "-u".into(), target], false)
+    } else {
+        (vec!["umount".into(), target], true)
+    }
+}
+
+/// A mounted place with a disconnect action. Works for anything mounted, not just connections
+/// saved through this app -- if the kernel says it is mounted, it can be unmounted.
+fn mounted_row(
+    p: &Place,
+    on_navigate: impl Fn(std::path::PathBuf) + 'static,
+    after: std::rc::Rc<dyn Fn()>,
+) -> gtk::Box {
+    let outer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    let button = place_row(p, on_navigate);
+    button.set_hexpand(true);
+    outer.append(&button);
+
+    let eject = gtk::Button::from_icon_name("media-eject-symbolic");
+    eject.add_css_class("flat");
+    eject.set_valign(gtk::Align::Center);
+    eject.set_tooltip_text(Some(&format!("Disconnect {}", p.name)));
+    let (argv, needs_root) = umount_argv_for(p);
+    let label = p.name.clone();
+    eject.connect_clicked(move |b| {
+        let (argv, after, label) = (argv.clone(), after.clone(), label.clone());
+        let parent = b.root().and_downcast::<gtk::Window>();
+        gtk::glib::spawn_future_local(async move {
+            let a = argv.clone();
+            let r = gtk::gio::spawn_blocking(move || crate::mounts::run(&a, needs_root)).await;
+            match r {
+                Ok(Ok(())) => after(),
+                Ok(Err(msg)) => report(
+                    parent.as_ref(),
+                    &format!("Could not disconnect {label}"),
+                    &msg,
+                ),
+                Err(_) => report(parent.as_ref(), "Could not disconnect", "the command did not run"),
+            }
+        });
+    });
+    outer.append(&eject);
+    outer
 }
 
 /// One clickable drive or mount point.
@@ -457,6 +579,7 @@ fn host_row(
     mounts: &[Place],
     reg: crate::Reg,
     on_navigate: impl Fn(std::path::PathBuf) + Clone + 'static,
+    after: std::rc::Rc<dyn Fn()>,
 ) -> gtk::Expander {
     let title = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     title.append(&gtk::Image::from_icon_name("computer-symbolic"));
@@ -475,7 +598,7 @@ fn host_row(
     let inner = gtk::Box::new(gtk::Orientation::Vertical, 0);
     inner.set_margin_start(14);
     for m in mounts {
-        inner.append(&place_row(m, on_navigate.clone()));
+        inner.append(&mounted_row(m, on_navigate.clone(), after.clone()));
     }
 
     let expander = gtk::Expander::new(None);
@@ -524,4 +647,176 @@ fn host_row(
     }
 
     expander
+}
+
+// --- saved connections: add, connect, disconnect ---------------------------------------------
+
+/// The "Connect to Server" dialog. Saves the definition, then mounts it.
+fn add_mount_dialog(
+    parent: Option<&gtk::Window>,
+    reg: crate::Reg,
+    after: std::rc::Rc<dyn Fn()>,
+) {
+    use crate::mounts::{MountDef, Transport};
+
+    let dialog = adw::MessageDialog::new(parent, Some("Connect to server"), None);
+    let form = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    form.set_margin_start(12);
+    form.set_margin_end(12);
+    form.set_margin_bottom(6);
+
+    let kind = gtk::DropDown::from_strings(&[Transport::Sshfs.label(), Transport::Nfs.label()]);
+    let name = gtk::Entry::new();
+    name.set_placeholder_text(Some("Name  (e.g. webgen-www)"));
+    let host = gtk::Entry::new();
+    host.set_placeholder_text(Some("Host  (e.g. webgen.com.au)"));
+    let user = gtk::Entry::new();
+    user.set_placeholder_text(Some("User  (optional — SSH only)"));
+    let port = gtk::Entry::new();
+    port.set_placeholder_text(Some("Port  (22 for SSH, blank for NFS)"));
+    let remote = gtk::Entry::new();
+    remote.set_placeholder_text(Some("Remote path  (e.g. /var/www)"));
+
+    for w in [&name, &host, &user, &port, &remote] {
+        form.append(w);
+    }
+    form.prepend(&kind);
+
+    // No password field, deliberately -- see the module docs on mounts.rs. Say so rather than
+    // leaving the user hunting for it.
+    let note = gtk::Label::new(Some(
+        "SSH connections use your existing SSH key. No passwords are stored.",
+    ));
+    note.add_css_class("dim-label");
+    note.add_css_class("caption");
+    note.set_wrap(true);
+    note.set_xalign(0.0);
+    form.append(&note);
+
+    dialog.set_extra_child(Some(&form));
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("connect", "Connect");
+    dialog.set_default_response(Some("connect"));
+    dialog.set_response_appearance("connect", adw::ResponseAppearance::Suggested);
+
+    dialog.connect_response(None, move |d, resp| {
+        if resp != "connect" {
+            d.close();
+            return;
+        }
+        let transport = if kind.selected() == 0 { Transport::Sshfs } else { Transport::Nfs };
+        let def = MountDef {
+            name: name.text().trim().replace('/', "-"),
+            transport,
+            host: host.text().trim().to_string(),
+            port: port.text().trim().parse().unwrap_or(22),
+            user: user.text().trim().to_string(),
+            remote: remote.text().trim().to_string(),
+        };
+        if def.name.is_empty() || def.host.is_empty() || def.remote.is_empty() {
+            d.set_body("Name, host and remote path are all needed.");
+            return;
+        }
+        d.close();
+        crate::mounts::save(&reg, &def);
+        connect(def, after.clone(), d.transient_for());
+    });
+    dialog.present();
+}
+
+/// Mount a saved definition, off the UI thread, reporting failure in a dialog.
+fn connect(
+    def: crate::mounts::MountDef,
+    after: std::rc::Rc<dyn Fn()>,
+    parent: Option<gtk::Window>,
+) {
+    gtk::glib::spawn_future_local(async move {
+        let d = def.clone();
+        let result = gtk::gio::spawn_blocking(move || {
+            crate::mounts::ensure_target(&d)?;
+            crate::mounts::run(&d.mount_argv(), d.transport.needs_root())
+        })
+        .await;
+
+        match result {
+            Ok(Ok(())) => after(),
+            Ok(Err(msg)) => report(parent.as_ref(), &format!("Could not connect {}", def.name), &msg),
+            Err(_) => report(parent.as_ref(), "Could not connect", "the mount command did not run"),
+        }
+    });
+}
+
+/// Unmount, then refresh.
+fn disconnect(
+    def: crate::mounts::MountDef,
+    after: std::rc::Rc<dyn Fn()>,
+    parent: Option<gtk::Window>,
+) {
+    gtk::glib::spawn_future_local(async move {
+        let d = def.clone();
+        let result = gtk::gio::spawn_blocking(move || {
+            crate::mounts::run(&d.umount_argv(), d.transport.needs_root())
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => after(),
+            // "Device or resource busy" is the common one and the user can act on it.
+            Ok(Err(msg)) => report(parent.as_ref(), &format!("Could not disconnect {}", def.name), &msg),
+            Err(_) => report(parent.as_ref(), "Could not disconnect", "the command did not run"),
+        }
+    });
+}
+
+fn report(parent: Option<&gtk::Window>, heading: &str, body: &str) {
+    let d = adw::MessageDialog::new(parent, Some(heading), Some(body));
+    d.add_response("ok", "OK");
+    d.present();
+}
+
+/// Saved connections that are not currently mounted, shown so they can be reconnected.
+fn saved_row(
+    def: &crate::mounts::MountDef,
+    reg: crate::Reg,
+    after: std::rc::Rc<dyn Fn()>,
+) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let icon = gtk::Image::from_icon_name("folder-remote-symbolic");
+    icon.set_opacity(0.45);
+    row.append(&icon);
+    let label = gtk::Label::new(Some(&def.name));
+    label.set_xalign(0.0);
+    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    label.set_hexpand(true);
+    label.add_css_class("dim-label");
+    row.append(&label);
+
+    let connect_btn = gtk::Button::from_icon_name("media-playback-start-symbolic");
+    connect_btn.add_css_class("flat");
+    connect_btn.set_valign(gtk::Align::Center);
+    connect_btn.set_tooltip_text(Some(&format!(
+        "Connect to {}:{}",
+        def.host_spec(),
+        def.remote
+    )));
+    {
+        let (def, after) = (def.clone(), after.clone());
+        connect_btn.connect_clicked(move |b| {
+            connect(def.clone(), after.clone(), b.root().and_downcast::<gtk::Window>());
+        });
+    }
+    row.append(&connect_btn);
+
+    let forget_btn = gtk::Button::from_icon_name("user-trash-symbolic");
+    forget_btn.add_css_class("flat");
+    forget_btn.set_valign(gtk::Align::Center);
+    forget_btn.set_tooltip_text(Some("Forget this connection"));
+    {
+        let (name, reg, after) = (def.name.clone(), reg.clone(), after.clone());
+        forget_btn.connect_clicked(move |_| {
+            crate::mounts::forget(&reg, &name);
+            after();
+        });
+    }
+    row.append(&forget_btn);
+    row
 }
