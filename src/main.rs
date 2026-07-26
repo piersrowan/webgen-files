@@ -27,6 +27,11 @@ use entry::Entry;
 use webgen_registry::Registry;
 
 const APP_ID: &str = "com.webgen.Files";
+
+/// Column widths, in characters. The row factory and the sort header both use these, so the
+/// headers stay lined up with the values beneath them.
+const SIZE_COL_CHARS: i32 = 10;
+const OWNER_COL_CHARS: i32 = 18;
 const FILES_NS: &str = "com.webgen.Files";
 
 type Reg = Option<Rc<Registry>>;
@@ -35,6 +40,21 @@ fn show_hidden(reg: &Reg) -> bool {
     reg.as_ref()
         .map(|r| r.get_bool(FILES_NS, "show_hidden", false))
         .unwrap_or(false)
+}
+
+/// Whether the Size and Owner columns are shown. Persisted so the choice survives a restart,
+/// the same way show_hidden is, and exposed in the settings manifest so System Settings can
+/// flip it too.
+fn show_details(reg: &Reg) -> bool {
+    reg.as_ref()
+        .map(|r| r.get_bool(FILES_NS, "show_details", false))
+        .unwrap_or(false)
+}
+
+fn store_show_details(reg: &Reg, on: bool) {
+    if let Some(r) = reg.as_ref() {
+        let _ = r.set_bool(FILES_NS, "show_details", on);
+    }
 }
 
 fn main() -> glib::ExitCode {
@@ -103,8 +123,24 @@ fn build_ui(app: &adw::Application) {
             sub.add_css_class("caption");
             text.append(&name);
             text.append(&sub);
+            text.set_hexpand(true);
             row.append(&icon);
             row.append(&text);
+
+            // Size and Owner columns. Fixed widths so they line up under the sort headers --
+            // this is a ListView, not a ColumnView, so the alignment is ours to maintain.
+            let size = gtk::Label::new(None);
+            size.set_xalign(1.0);
+            size.set_width_chars(SIZE_COL_CHARS);
+            size.add_css_class("dim-label");
+            size.add_css_class("numeric");
+            let owner = gtk::Label::new(None);
+            owner.set_xalign(0.0);
+            owner.set_width_chars(OWNER_COL_CHARS);
+            owner.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            owner.add_css_class("dim-label");
+            row.append(&size);
+            row.append(&owner);
             item.set_child(Some(&row));
 
             // Right-click: select this row (unless it's already in a multi-selection) then open the
@@ -146,7 +182,9 @@ fn build_ui(app: &adw::Application) {
         let e = b.borrow::<Entry>();
         let row = item.child().and_downcast::<gtk::Box>().unwrap();
         let icon = row.first_child().and_downcast::<gtk::Image>().unwrap();
-        let text = row.last_child().and_downcast::<gtk::Box>().unwrap();
+        let owner_lbl = row.last_child().and_downcast::<gtk::Label>().unwrap();
+        let size_lbl = owner_lbl.prev_sibling().and_downcast::<gtk::Label>().unwrap();
+        let text = size_lbl.prev_sibling().and_downcast::<gtk::Box>().unwrap();
         let name = text.first_child().and_downcast::<gtk::Label>().unwrap();
         let sub = text.last_child().and_downcast::<gtk::Label>().unwrap();
 
@@ -155,6 +193,16 @@ fn build_ui(app: &adw::Application) {
             None => icon.set_icon_name(Some(if e.is_dir { "folder" } else { "text-x-generic" })),
         }
         name.set_text(&e.name);
+
+        // Visibility follows whether the entry carries details at all: list_dir only populates
+        // owner when the columns are on, so there is nothing to show otherwise.
+        let detailed = !e.owner.is_empty();
+        size_lbl.set_visible(detailed);
+        owner_lbl.set_visible(detailed);
+        if detailed {
+            size_lbl.set_text(&entry::human_size(e.size));
+            owner_lbl.set_text(&format!("{} : {}", e.owner, e.group));
+        }
         if e.subtitle.is_empty() {
             sub.set_visible(false);
         } else {
@@ -205,25 +253,80 @@ fn build_ui(app: &adw::Application) {
     status.set_xalign(0.0);
     status.add_css_class("dim-label");
 
+    // ---- details columns + sorting -----------------------------------------------------------
+    // Sort state lives here and is applied when the list is (re)built. Clicking a header
+    // re-sorts the entries already in hand rather than re-reading the folder.
+    let sort_key = Rc::new(Cell::new(entry::SortKey::Name));
+    let sort_desc = Rc::new(Cell::new(false));
+    let details = Rc::new(Cell::new(show_details(&reg)));
+
+    let hdr_name = gtk::Button::with_label("Name");
+    let hdr_size = gtk::Button::with_label("Size");
+    let hdr_owner = gtk::Button::with_label("Owner : Group");
+    for b in [&hdr_name, &hdr_size, &hdr_owner] {
+        b.add_css_class("flat");
+        b.add_css_class("caption-heading");
+    }
+    hdr_name.set_hexpand(true);
+    if let Some(l) = hdr_name.child().and_downcast::<gtk::Label>() {
+        l.set_xalign(0.0);
+    }
+    hdr_size.set_size_request(SIZE_COL_CHARS * 9, -1);
+    hdr_owner.set_size_request(OWNER_COL_CHARS * 9, -1);
+
+    let sort_header = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    sort_header.set_margin_start(40); // clear the icon column
+    sort_header.set_margin_end(6);
+    sort_header.append(&hdr_name);
+    sort_header.append(&hdr_size);
+    sort_header.append(&hdr_owner);
+    sort_header.set_visible(details.get());
+
+    // An arrow on the active header, so the current sort is legible at a glance.
+    let sync_headers = {
+        let (hdr_name, hdr_size, hdr_owner) = (hdr_name.clone(), hdr_size.clone(), hdr_owner.clone());
+        let (sort_key, sort_desc) = (sort_key.clone(), sort_desc.clone());
+        Rc::new(move || {
+            let arrow = if sort_desc.get() { " \u{25be}" } else { " \u{25b4}" };
+            for (b, base, k) in [
+                (&hdr_name, "Name", entry::SortKey::Name),
+                (&hdr_size, "Size", entry::SortKey::Size),
+                (&hdr_owner, "Owner : Group", entry::SortKey::Owner),
+            ] {
+                if sort_key.get() == k {
+                    b.set_label(&format!("{base}{arrow}"));
+                } else {
+                    b.set_label(base);
+                }
+            }
+        })
+    };
+    sync_headers();
+
     // ---- reload: rebuild the file list for the current folder + query -------------------------
     let reload: Rc<dyn Fn()> = {
         let (store, current, reg, query, recursive) =
             (store.clone(), current.clone(), reg.clone(), query.clone(), recursive.clone());
         let (filter, path_entry, status) = (filter.clone(), path_entry.clone(), status.clone());
+        let (details, sort_key, sort_desc) = (details.clone(), sort_key.clone(), sort_desc.clone());
         Rc::new(move || {
             store.remove_all();
             let dir = current.borrow().clone();
             let hidden = show_hidden(&reg);
+            let detail = details.get();
             let q = query.borrow().clone();
             let mut capped = false;
             if recursive.get() && !q.trim().is_empty() {
-                let (entries, was_capped) = entry::search(&dir, q.trim(), hidden);
+                let (mut entries, was_capped) = entry::search(&dir, q.trim(), hidden, detail);
                 capped = was_capped;
+                entry::sort_by(&mut entries, sort_key.get(), sort_desc.get());
                 for e in entries {
                     store.append(&BoxedAnyObject::new(e));
                 }
             } else {
-                for e in entry::list_dir(&dir, hidden) {
+                let mut entries = entry::list_dir(&dir, hidden, detail);
+                entry::sort_by(&mut entries, sort_key.get(), sort_desc.get());
+                for e in entries {
                     store.append(&BoxedAnyObject::new(e));
                 }
             }
@@ -290,7 +393,12 @@ fn build_ui(app: &adw::Application) {
     );
     let split = gtk::Paned::new(gtk::Orientation::Horizontal);
     split.set_start_child(Some(&tree_pane));
-    split.set_end_child(Some(&list_scroller));
+    // The list pane: sort header above, list below. The header is a sibling of the scroller
+    // rather than inside it, so it stays put while the list scrolls.
+    let list_pane = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    list_pane.append(&sort_header);
+    list_pane.append(&list_scroller);
+    split.set_end_child(Some(&list_pane));
     split.set_resize_start_child(false);
     split.set_shrink_start_child(false);
     split.set_position(240);
@@ -304,6 +412,11 @@ fn build_ui(app: &adw::Application) {
     header.pack_start(&nav_box);
     header.pack_start(&btn_tree);
     header.set_title_widget(Some(&path_entry));
+    let btn_details = gtk::ToggleButton::new();
+    btn_details.set_icon_name("view-list-symbolic");
+    btn_details.set_tooltip_text(Some("Show size and owner columns"));
+    btn_details.set_active(details.get());
+    header.pack_end(&btn_details);
     header.pack_end(&btn_new);
     header.pack_end(&btn_openwith);
     header.pack_end(&btn_paste);
@@ -652,6 +765,52 @@ fn build_ui(app: &adw::Application) {
             reload();
         }
     ));
+    // Details toggle: persist, show/hide the sort header, and re-read the folder (the extra
+    // attributes have to come from a fresh enumerate).
+    btn_details.connect_toggled(clone!(
+        #[strong] details,
+        #[strong] reg,
+        #[strong] reload,
+        #[strong] sort_header,
+        #[strong] sort_key,
+        move |b| {
+            let on = b.is_active();
+            details.set(on);
+            store_show_details(&reg, on);
+            sort_header.set_visible(on);
+            // Size/Owner have nothing to sort on once the columns are gone.
+            if !on && sort_key.get() != entry::SortKey::Name {
+                sort_key.set(entry::SortKey::Name);
+            }
+            reload();
+        }
+    ));
+
+    // Header clicks: same header again flips direction, a different one switches key and
+    // starts ascending.
+    for (button, key) in [
+        (&hdr_name, entry::SortKey::Name),
+        (&hdr_size, entry::SortKey::Size),
+        (&hdr_owner, entry::SortKey::Owner),
+    ] {
+        button.connect_clicked(clone!(
+            #[strong] sort_key,
+            #[strong] sort_desc,
+            #[strong] sync_headers,
+            #[strong] reload,
+            move |_| {
+                if sort_key.get() == key {
+                    sort_desc.set(!sort_desc.get());
+                } else {
+                    sort_key.set(key);
+                    sort_desc.set(false);
+                }
+                sync_headers();
+                reload();
+            }
+        ));
+    }
+
     chk_recursive.connect_toggled(clone!(
         #[strong] recursive,
         #[strong] reload,

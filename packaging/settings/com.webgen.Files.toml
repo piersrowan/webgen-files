@@ -10,3 +10,10 @@ type = "bool"
 label = "Show hidden files"
 group = "View"
 default = false
+
+[[setting]]
+key = "show_details"
+type = "bool"
+label = "Show size and owner columns"
+group = "Files"
+default = false
