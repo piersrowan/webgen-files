@@ -8,6 +8,10 @@
 mod assoc;
 mod entry;
 mod meta;
+// Landed model-first: the Places data layer is complete and tested, but the sidebar that
+// renders it is not built yet, so nothing calls into it. Scoped to this module rather than
+// crate-wide, and it comes off the moment the sidebar lands.
+#[allow(dead_code)]
 mod places;
 mod tree;
 
