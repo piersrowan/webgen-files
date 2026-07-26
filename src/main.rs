@@ -396,8 +396,34 @@ fn build_ui(app: &adw::Application) {
         show_hidden(&reg),
         clone!(#[strong] navigate, move |p| navigate(p)),
     );
+    // Sidebar: Places (mounted drives + network locations, grouped by host) above the folder
+    // tree. Places is a fixed-height section; the tree takes the remaining space and scrolls.
+    let (places_box, refresh_places) = places::build(
+        reg.clone(),
+        clone!(#[strong] navigate, move |p| navigate(p)),
+    );
+    // Mounts change without the app being told -- a stick is plugged in, a share is mounted
+    // from a terminal. Poll /proc/mounts (one small read) so drives appear and disappear on
+    // their own; the rebuild is skipped unless the mount set actually changed.
+    glib::timeout_add_seconds_local(3, {
+        let refresh_places = refresh_places.clone();
+        move || {
+            refresh_places();
+            glib::ControlFlow::Continue
+        }
+    });
+
+    let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    sidebar.append(&places_box);
+    sidebar.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    tree_pane.set_vexpand(true);
+    sidebar.append(&tree_pane);
+    let sidebar_scroller = gtk::ScrolledWindow::new();
+    sidebar_scroller.set_hscrollbar_policy(gtk::PolicyType::Never);
+    sidebar_scroller.set_child(Some(&sidebar));
+
     let split = gtk::Paned::new(gtk::Orientation::Horizontal);
-    split.set_start_child(Some(&tree_pane));
+    split.set_start_child(Some(&sidebar_scroller));
     // The list pane: sort header above, list below. The header is a sibling of the scroller
     // rather than inside it, so it stays put while the list scrolls.
     let list_pane = gtk::Box::new(gtk::Orientation::Vertical, 0);

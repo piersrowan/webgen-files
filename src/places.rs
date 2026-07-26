@@ -318,3 +318,210 @@ mod tests {
         }
     }
 }
+
+// --- the sidebar widget ---------------------------------------------------------------------
+//
+// Kept apart from the model above so that half stays pure and unit-testable: nothing before
+// this point touches GTK.
+
+use adw::prelude::*;
+
+/// Registry key holding the friendly name for a host, e.g. `hostname:webgen` -> "WebGen NFS
+/// Server". Namespaced so it cannot collide with the app's own settings keys.
+fn rename_key(host: &str) -> String {
+    format!("hostname:{host}")
+}
+
+/// Build the Places section: Devices, then Network grouped by host.
+///
+/// `on_navigate` moves the file list. `reg` stores per-host friendly names. Returns the widget
+/// and a closure that rebuilds it, so the caller can refresh after a mount or unmount.
+pub fn build(
+    reg: crate::Reg,
+    on_navigate: impl Fn(std::path::PathBuf) + Clone + 'static,
+) -> (gtk::Box, std::rc::Rc<dyn Fn()>) {
+    let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+
+    // Fingerprint of the last-rendered mount set. Rebuilding on every tick would throw away
+    // expander state and flicker, so the widget tree is only rebuilt when what is mounted
+    // actually changes.
+    let last = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+
+    let rebuild: std::rc::Rc<dyn Fn()> = {
+        let container = container.clone();
+        let last = last.clone();
+        std::rc::Rc::new(move || {
+            let all = places();
+            let fingerprint = all
+                .iter()
+                .map(|p| format!("{}\u{1}{}", p.path.display(), p.fstype))
+                .collect::<Vec<_>>()
+                .join("\u{2}");
+            if *last.borrow() == fingerprint && container.first_child().is_some() {
+                return;
+            }
+            *last.borrow_mut() = fingerprint;
+
+            while let Some(c) = container.first_child() {
+                container.remove(&c);
+            }
+            let drives = local_drives(&all);
+            let reg2 = reg.clone();
+            let hosts = network_hosts(&all, move |h| {
+                reg2.as_ref()
+                    .and_then(|r| r.get_string(crate::FILES_NS, &rename_key(h)))
+                    .filter(|s| !s.trim().is_empty())
+            });
+
+            // Nothing mounted beyond the root filesystem is the normal state on WebGen today --
+            // nothing auto-mounts removable media yet. Say so plainly rather than showing an
+            // empty heading, which reads as broken.
+            if drives.is_empty() && hosts.is_empty() {
+                let hint = gtk::Label::new(Some("No drives or network locations mounted"));
+                hint.add_css_class("dim-label");
+                hint.add_css_class("caption");
+                hint.set_wrap(true);
+                hint.set_xalign(0.0);
+                hint.set_margin_start(12);
+                hint.set_margin_end(12);
+                hint.set_margin_top(8);
+                hint.set_margin_bottom(8);
+                container.append(&hint);
+                return;
+            }
+
+            if !drives.is_empty() {
+                container.append(&heading("Devices"));
+                for d in &drives {
+                    container.append(&place_row(d, on_navigate.clone()));
+                }
+            }
+
+            if !hosts.is_empty() {
+                container.append(&heading("Network"));
+                for (host, display, mounts) in &hosts {
+                    container.append(&host_row(
+                        host,
+                        display,
+                        mounts,
+                        reg.clone(),
+                        on_navigate.clone(),
+                    ));
+                }
+            }
+        })
+    };
+
+    rebuild();
+    (container, rebuild)
+}
+
+fn heading(text: &str) -> gtk::Label {
+    let l = gtk::Label::new(Some(text));
+    l.set_xalign(0.0);
+    l.add_css_class("dim-label");
+    l.add_css_class("caption-heading");
+    l.set_margin_start(12);
+    l.set_margin_top(10);
+    l.set_margin_bottom(2);
+    l
+}
+
+/// One clickable drive or mount point.
+fn place_row(p: &Place, on_navigate: impl Fn(std::path::PathBuf) + 'static) -> gtk::Button {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    row.append(&gtk::Image::from_icon_name(icon_for(p)));
+    let label = gtk::Label::new(Some(&p.name));
+    label.set_xalign(0.0);
+    label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    label.set_hexpand(true);
+    row.append(&label);
+
+    let button = gtk::Button::new();
+    button.set_child(Some(&row));
+    button.add_css_class("flat");
+    // Full path and filesystem type on hover -- the row itself stays short.
+    button.set_tooltip_text(Some(&format!("{}  ({})", p.path.display(), p.fstype)));
+    let path = p.path.clone();
+    button.connect_clicked(move |_| on_navigate(path.clone()));
+    button
+}
+
+/// A network host: one expandable entry containing its mount points, with a rename action.
+///
+/// This is the point of the whole module -- several transports onto one machine read as one
+/// machine. The expander shows only the mount points, because you cannot traverse above them.
+fn host_row(
+    host: &str,
+    display: &str,
+    mounts: &[Place],
+    reg: crate::Reg,
+    on_navigate: impl Fn(std::path::PathBuf) + Clone + 'static,
+) -> gtk::Expander {
+    let title = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    title.append(&gtk::Image::from_icon_name("computer-symbolic"));
+    let label = gtk::Label::new(Some(display));
+    label.set_xalign(0.0);
+    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    label.set_hexpand(true);
+    title.append(&label);
+
+    let rename = gtk::Button::from_icon_name("document-edit-symbolic");
+    rename.add_css_class("flat");
+    rename.set_valign(gtk::Align::Center);
+    rename.set_tooltip_text(Some("Rename this computer"));
+    title.append(&rename);
+
+    let inner = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    inner.set_margin_start(14);
+    for m in mounts {
+        inner.append(&place_row(m, on_navigate.clone()));
+    }
+
+    let expander = gtk::Expander::new(None);
+    expander.set_label_widget(Some(&title));
+    expander.set_child(Some(&inner));
+    expander.set_expanded(true);
+
+    // Rename: the friendly name is per host and remembered, so "webgen" can read
+    // "WebGen NFS Server" without changing what is actually mounted.
+    {
+        let (host, label) = (host.to_string(), label.clone());
+        rename.connect_clicked(move |btn| {
+            // Resolve the window at click time by walking up from the button. The sidebar is
+            // built before the window exists, so it cannot be captured here.
+            let parent = btn.root().and_downcast::<gtk::Window>();
+            let dialog = adw::MessageDialog::new(
+                parent.as_ref(),
+                Some("Rename computer"),
+                Some(&format!("Shown instead of \"{host}\" in the sidebar.")),
+            );
+            let field = gtk::Entry::new();
+            field.set_text(&label.text());
+            field.set_margin_start(12);
+            field.set_margin_end(12);
+            field.set_margin_bottom(6);
+            dialog.set_extra_child(Some(&field));
+            dialog.add_response("cancel", "Cancel");
+            dialog.add_response("save", "Rename");
+            dialog.set_default_response(Some("save"));
+            dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+
+            let (reg, host, label) = (reg.clone(), host.clone(), label.clone());
+            dialog.connect_response(None, move |d, resp| {
+                if resp == "save" {
+                    let name = field.text().trim().to_string();
+                    if let Some(r) = reg.as_ref() {
+                        // Empty clears the override and falls back to the real host name.
+                        let _ = r.set_string(crate::FILES_NS, &rename_key(&host), &name);
+                    }
+                    label.set_text(if name.is_empty() { &host } else { &name });
+                }
+                d.close();
+            });
+            dialog.present();
+        });
+    }
+
+    expander
+}
