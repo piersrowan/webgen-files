@@ -8,6 +8,7 @@
 mod assoc;
 mod entry;
 mod meta;
+mod places;
 mod tree;
 
 use std::cell::{Cell, RefCell};
