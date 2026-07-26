@@ -387,7 +387,7 @@ pub fn build(
             // Nothing mounted beyond the root filesystem is the normal state on WebGen today --
             // nothing auto-mounts removable media yet. Say so plainly rather than showing an
             // empty heading, which reads as broken.
-            if drives.is_empty() && hosts.is_empty() {
+            if drives.is_empty() && hosts.is_empty() && crate::blockdev::volumes().iter().all(|v| v.is_mounted()) {
                 let hint = gtk::Label::new(Some("No drives or network locations mounted"));
                 hint.add_css_class("dim-label");
                 hint.add_css_class("caption");
@@ -401,7 +401,15 @@ pub fn build(
                 return;
             }
 
-            if !drives.is_empty() {
+            // Volumes the machine can see but that are not mounted -- the USB stick nobody
+            // mounted, the Windows partition on the internal disk. /proc/mounts can never show
+            // these, and they are usually exactly what the user came looking for.
+            let unmounted: Vec<crate::blockdev::Volume> = crate::blockdev::volumes()
+                .into_iter()
+                .filter(|v| !v.is_mounted())
+                .collect();
+
+            if !drives.is_empty() || !unmounted.is_empty() {
                 container.append(&heading("Devices"));
                 for d in &drives {
                     if d.kind == Kind::Removable {
@@ -413,6 +421,13 @@ pub fn build(
                     } else {
                         container.append(&place_row(d, on_navigate.clone()));
                     }
+                }
+                for v in &unmounted {
+                    let r = rebuild_ref.clone();
+                    let after: std::rc::Rc<dyn Fn()> = std::rc::Rc::new(move || {
+                        if let Some(f) = r.borrow().as_ref() { f(); }
+                    });
+                    container.append(&unmounted_row(v, after));
                 }
             }
 
@@ -825,5 +840,96 @@ fn saved_row(
         });
     }
     row.append(&forget_btn);
+    row
+}
+
+/// A volume the machine can see but has not mounted: greyed, with a mount action.
+///
+/// Mounting is behind a confirmation because it is a real operation on real hardware -- it can
+/// spin up a disk, replay a dirty journal, or expose a filesystem that arrived from somewhere
+/// else. A single stray click should not do that.
+fn unmounted_row(v: &crate::blockdev::Volume, after: std::rc::Rc<dyn Fn()>) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+
+    let icon = gtk::Image::from_icon_name(if v.removable {
+        "drive-removable-media-symbolic"
+    } else {
+        "drive-harddisk-symbolic"
+    });
+    icon.set_opacity(0.45);
+    row.append(&icon);
+
+    let text = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    text.set_hexpand(true);
+    let name = gtk::Label::new(Some(&v.display_name()));
+    name.set_xalign(0.0);
+    name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    name.add_css_class("dim-label");
+    let detail = gtk::Label::new(Some(&format!("{}  ·  {}  ·  not mounted", v.size, v.fstype)));
+    detail.set_xalign(0.0);
+    detail.add_css_class("dim-label");
+    detail.add_css_class("caption");
+    text.append(&name);
+    text.append(&detail);
+    row.append(&text);
+
+    let mount = gtk::Button::from_icon_name("media-playback-start-symbolic");
+    mount.add_css_class("flat");
+    mount.set_valign(gtk::Align::Center);
+    mount.set_tooltip_text(Some(&format!("Mount {} at {}", v.device(), v.mount_target())));
+
+    let vol = v.clone();
+    mount.connect_clicked(move |b| {
+        let parent = b.root().and_downcast::<gtk::Window>();
+        let dialog = adw::MessageDialog::new(
+            parent.as_ref(),
+            Some(&format!("Mount {}?", vol.display_name())),
+            Some(&format!(
+                "{} ({}, {}) will be mounted at {}.",
+                vol.device(),
+                vol.fstype,
+                vol.size,
+                vol.mount_target()
+            )),
+        );
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("mount", "Mount");
+        dialog.set_default_response(Some("mount"));
+        dialog.set_response_appearance("mount", adw::ResponseAppearance::Suggested);
+
+        let (vol, after) = (vol.clone(), after.clone());
+        dialog.connect_response(None, move |d, resp| {
+            d.close();
+            if resp != "mount" {
+                return;
+            }
+            let (vol, after) = (vol.clone(), after.clone());
+            let parent = d.transient_for();
+            gtk::glib::spawn_future_local(async move {
+                let v2 = vol.clone();
+                let r = gtk::gio::spawn_blocking(move || {
+                    // The mount point has to exist first, and creating it under /media needs
+                    // root -- so it goes through the same sudo -n call as the mount.
+                    let mkdir = vec!["mkdir".to_string(), "-p".into(), v2.mount_target()];
+                    crate::mounts::run(&mkdir, true)?;
+                    let uid = unsafe { libc::getuid() };
+                    let gid = unsafe { libc::getgid() };
+                    crate::mounts::run(&v2.mount_argv(uid, gid), true)
+                })
+                .await;
+                match r {
+                    Ok(Ok(())) => after(),
+                    Ok(Err(msg)) => report(
+                        parent.as_ref(),
+                        &format!("Could not mount {}", vol.display_name()),
+                        &msg,
+                    ),
+                    Err(_) => report(parent.as_ref(), "Could not mount", "the command did not run"),
+                }
+            });
+        });
+        dialog.present();
+    });
+    row.append(&mount);
     row
 }

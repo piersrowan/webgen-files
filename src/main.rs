@@ -6,6 +6,7 @@
 //! associations ([`assoc`]), which System Settings edits too.
 
 mod assoc;
+mod blockdev;
 mod entry;
 mod meta;
 mod mounts;
