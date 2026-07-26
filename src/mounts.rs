@@ -69,6 +69,9 @@ pub struct MountDef {
     /// SSH user. Empty means "whoever I am locally".
     pub user: String,
     pub remote: String,
+    /// Mount writable. **Defaults to false** -- a share is far more often browsed than edited,
+    /// and a read-only mount cannot damage the far end by accident. Opt in when you mean it.
+    pub writable: bool,
 }
 
 impl MountDef {
@@ -80,6 +83,11 @@ impl MountDef {
             Transport::Sshfs => gtk::glib::home_dir().join("mnt").join(&self.name),
             Transport::Nfs => PathBuf::from("/mnt").join(&self.name),
         }
+    }
+
+    /// The mount option controlling writability. Both sshfs and mount(8) take ro/rw.
+    pub fn rw_option(&self) -> &'static str {
+        if self.writable { "rw" } else { "ro" }
     }
 
     /// `user@host` or just `host`.
@@ -95,12 +103,13 @@ impl MountDef {
         // Tab-separated: none of these fields can contain a tab, and it avoids inventing an
         // escaping scheme for a five-field record.
         format!(
-            "{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}",
             self.transport.tag(),
             self.host,
             self.port,
             self.user,
-            self.remote
+            self.remote,
+            if self.writable { "rw" } else { "ro" }
         )
     }
 
@@ -116,6 +125,9 @@ impl MountDef {
             port: f[2].parse().ok()?,
             user: f[3].to_string(),
             remote: f[4].to_string(),
+            // Definitions saved before this field existed have five fields; treat them as
+            // read-only, which is the safe reading of a missing value.
+            writable: f.get(5).map(|v| *v == "rw").unwrap_or(false),
         })
     }
 
@@ -131,7 +143,10 @@ impl MountDef {
                 "-p".into(),
                 self.port.to_string(),
                 "-o".into(),
-                "reconnect,ServerAliveInterval=15,ServerAliveCountMax=3".into(),
+                format!(
+                    "{},reconnect,ServerAliveInterval=15,ServerAliveCountMax=3",
+                    self.rw_option()
+                ),
                 format!("{}:{}", self.host_spec(), self.remote),
                 target,
             ],
@@ -139,6 +154,8 @@ impl MountDef {
                 "mount".into(),
                 "-t".into(),
                 "nfs4".into(),
+                "-o".into(),
+                self.rw_option().to_string(),
                 format!("{}:{}", self.host, self.remote),
                 target,
             ],
@@ -269,6 +286,7 @@ mod tests {
             port: 2222,
             user: "piers".into(),
             remote: "/var/www".into(),
+            writable: false,
         }
     }
 
@@ -337,5 +355,61 @@ mod tests {
         let mut d = ssh();
         d.name = "definitely-not-mounted-xyz".into();
         assert!(!is_connected(&d));
+    }
+}
+
+#[cfg(test)]
+mod rw_tests {
+    use super::*;
+
+    fn d(writable: bool) -> MountDef {
+        MountDef {
+            name: "share".into(),
+            transport: Transport::Sshfs,
+            host: "webgen.com.au".into(),
+            port: 2222,
+            user: String::new(),
+            remote: "/var/www".into(),
+            writable,
+        }
+    }
+
+    #[test]
+    fn read_only_is_the_default_and_reaches_the_command() {
+        let argv = d(false).mount_argv().join(" ");
+        assert!(argv.contains("ro,reconnect"), "read-only must be passed: {argv}");
+        assert!(!argv.contains("rw,"), "must not mount writable when not asked");
+    }
+
+    #[test]
+    fn writable_is_opt_in_and_reaches_the_command() {
+        let argv = d(true).mount_argv().join(" ");
+        assert!(argv.contains("rw,reconnect"), "read-write must be passed: {argv}");
+    }
+
+    #[test]
+    fn nfs_carries_the_same_option() {
+        let mut m = d(true);
+        m.transport = Transport::Nfs;
+        let argv = m.mount_argv();
+        let i = argv.iter().position(|a| a == "-o").expect("-o must be present");
+        assert_eq!(argv[i + 1], "rw");
+    }
+
+    #[test]
+    fn writability_survives_a_save_and_load() {
+        for w in [false, true] {
+            let m = d(w);
+            assert_eq!(MountDef::decode(&m.name, &m.encode()).unwrap().writable, w);
+        }
+    }
+
+    #[test]
+    fn a_definition_saved_before_this_field_existed_reads_as_read_only() {
+        // Five-field records predate `writable`. Defaulting them to read-only is the safe
+        // reading of a missing value -- the alternative silently makes an old mount writable.
+        let old = "sshfs\twebgen.com.au\t2222\t\t/var/www";
+        let parsed = MountDef::decode("share", old).expect("old records must still load");
+        assert!(!parsed.writable);
     }
 }

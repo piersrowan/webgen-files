@@ -682,6 +682,11 @@ fn add_mount_dialog(
     }
     form.prepend(&kind);
 
+    // Read-only by default. A share is browsed far more often than edited, and a read-only
+    // mount cannot damage the far end by accident -- so writing is opt-in, not opt-out.
+    let writable = gtk::CheckButton::with_label("Allow writing (default is read-only)");
+    form.append(&writable);
+
     // No password field, deliberately -- see the module docs on mounts.rs. Say so rather than
     // leaving the user hunting for it.
     let note = gtk::Label::new(Some(
@@ -712,6 +717,7 @@ fn add_mount_dialog(
             port: port.text().trim().parse().unwrap_or(22),
             user: user.text().trim().to_string(),
             remote: remote.text().trim().to_string(),
+            writable: writable.is_active(),
         };
         if def.name.is_empty() || def.host.is_empty() || def.remote.is_empty() {
             d.set_body("Name, host and remote path are all needed.");
@@ -794,9 +800,10 @@ fn saved_row(
     connect_btn.add_css_class("flat");
     connect_btn.set_valign(gtk::Align::Center);
     connect_btn.set_tooltip_text(Some(&format!(
-        "Connect to {}:{}",
+        "Connect to {}:{}  ({})",
         def.host_spec(),
-        def.remote
+        def.remote,
+        if def.writable { "read-write" } else { "read-only" }
     )));
     {
         let (def, after) = (def.clone(), after.clone());
