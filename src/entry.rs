@@ -247,6 +247,15 @@ pub fn copy_into(src: &Path, dest_dir: &Path) -> std::io::Result<PathBuf> {
 
 /// Move `src` into `dest_dir` (used by cut+paste). Fast `rename` within a filesystem, falling back to
 /// copy-then-delete across devices. Non-clobbering, and a no-op if `src` is already in `dest_dir`.
+/// Would moving `src` into `dest_dir` destroy it?
+///
+/// Dragging a folder onto itself, or onto something inside itself, is not a move — it is an
+/// unrecoverable shuffle that buries the folder in its own subtree. The drop handler refuses these
+/// silently rather than reporting an error, because the user's gesture simply had no meaning.
+pub fn is_self_move(src: &Path, dest_dir: &Path) -> bool {
+    dest_dir == src || dest_dir.starts_with(src)
+}
+
 pub fn move_into(src: &Path, dest_dir: &Path) -> std::io::Result<PathBuf> {
     if src.parent() == Some(dest_dir) {
         return Ok(src.to_path_buf());
@@ -422,5 +431,47 @@ mod detail_tests {
         assert_eq!(ids.user(0), "root", "uid 0 should resolve from /etc/passwd");
         // An id that cannot exist falls back to its number rather than being blank.
         assert_eq!(ids.user(4_294_967_294), "4294967294");
+    }
+}
+
+#[cfg(test)]
+mod dnd_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn a_folder_cannot_be_dropped_into_itself_or_its_own_subtree() {
+        let f = PathBuf::from("/home/u/Work");
+        assert!(is_self_move(&f, &f), "onto itself");
+        assert!(is_self_move(&f, &PathBuf::from("/home/u/Work/2026")), "into its own child");
+        assert!(is_self_move(&f, &PathBuf::from("/home/u/Work/a/b/c")), "into a deep descendant");
+    }
+
+    #[test]
+    fn ordinary_moves_are_allowed() {
+        let f = PathBuf::from("/home/u/Work");
+        assert!(!is_self_move(&f, &PathBuf::from("/home/u/Archive")));
+        assert!(!is_self_move(&f, &PathBuf::from("/home/u")), "into its own parent is fine");
+        // A sibling whose name merely starts with the same text is NOT a descendant. A plain
+        // string prefix test would wrongly refuse this; starts_with on Path compares components.
+        assert!(!is_self_move(&f, &PathBuf::from("/home/u/Workshop")));
+    }
+
+    #[test]
+    fn a_move_into_the_folder_it_already_sits_in_is_a_no_op() {
+        // Dropping a file back where it came from must not rename it to "file (copy)".
+        let d = tempdir();
+        let src = d.join("a.txt");
+        std::fs::write(&src, b"x").unwrap();
+        let got = move_into(&src, &d).unwrap();
+        assert_eq!(got, src);
+        assert!(src.exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn tempdir() -> PathBuf {
+        let p = std::env::temp_dir().join(format!("wgf-dnd-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&p);
+        p
     }
 }

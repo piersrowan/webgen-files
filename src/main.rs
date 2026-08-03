@@ -108,9 +108,14 @@ fn build_ui(app: &adw::Application) {
     let selection = gtk::MultiSelection::new(Some(filtered));
     let menu_opener: MenuOpener = Rc::new(RefCell::new(None));
 
+    // Filled once `reload` exists (below). Drag-and-drop needs to refresh the view after a move,
+    // and the factory that wires the drop handler is built before reload is.
+    let reload_slot: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+
     let factory = gtk::SignalListItemFactory::new();
     factory.connect_setup(clone!(
         #[strong] selection,
+        #[strong] reload_slot,
         #[strong] menu_opener,
         move |_, item| {
             let item = item.downcast_ref::<gtk::ListItem>().unwrap();
@@ -133,6 +138,79 @@ fn build_ui(app: &adw::Application) {
             text.set_hexpand(true);
             row.append(&icon);
             row.append(&text);
+
+            // --- drag and drop: move ------------------------------------------------------
+            //
+            // Rows are RECYCLED by the ListView, so neither controller can capture a path here --
+            // by the time a drag starts, this widget may be showing a different file. Both read
+            // the row's CURRENT item out of the ListItem instead, which is also how connect_bind
+            // works a few lines down.
+            //
+            // Transfer type is gdk::FileList, not a path string: it is what every other GTK file
+            // manager sends and accepts, so a drag out of WebGen Files lands correctly in one of
+            // them, and vice versa. A private string format would work only against ourselves.
+            let src = gtk::DragSource::new();
+            src.set_actions(gdk::DragAction::MOVE);
+            src.connect_prepare(clone!(
+                #[strong] selection,
+                #[weak] item,
+                #[upgrade_or] None,
+                move |_, _, _| {
+                    let dragged = entry_of(&item)?;
+                    // Dragging a row that is part of the current selection moves the whole
+                    // selection; dragging one outside it moves just that row. Same rule the
+                    // delete path uses, so the two cannot surprise each other.
+                    let mut files: Vec<gio::File> = selected(&selection)
+                        .into_iter()
+                        .map(|e| gio::File::for_path(&e.path))
+                        .collect();
+                    if !files.iter().any(|f| f.path().as_deref() == Some(dragged.path.as_path())) {
+                        files = vec![gio::File::for_path(&dragged.path)];
+                    }
+                    Some(gdk::ContentProvider::for_value(&gdk::FileList::from_array(&files).into()))
+                }
+            ));
+            row.add_controller(src);
+
+            // Dropping ONTO a folder moves into it. A file is not a drop target: dropping onto one
+            // has no meaning, and accepting it silently would move things somewhere the user did
+            // not point at.
+            let drop = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::MOVE);
+            drop.connect_accept(clone!(
+                #[weak] item,
+                #[upgrade_or] false,
+                move |_, _| entry_of(&item).map(|e| e.is_dir).unwrap_or(false)
+            ));
+            drop.connect_drop(clone!(
+                #[strong] reload_slot,
+                #[weak] item,
+                #[upgrade_or] false,
+                move |_, value, _, _| {
+                    let Some(dest) = entry_of(&item).filter(|e| e.is_dir) else { return false };
+                    let Ok(list) = value.get::<gdk::FileList>() else { return false };
+                    let mut moved = 0usize;
+                    for f in list.files() {
+                        let Some(p) = f.path() else { continue };
+                        // Refuse to move a folder into itself or into its own descendant -- that
+                        // is an unrecoverable shuffle, not a move.
+                        if crate::entry::is_self_move(&p, &dest.path) {
+                            continue;
+                        }
+                        if crate::entry::move_into(&p, &dest.path).is_ok() {
+                            moved += 1;
+                        }
+                    }
+                    if moved > 0 {
+                        // `reload` is built further down, after the store and filter exist, so the
+                        // factory cannot capture it directly -- it reads it back out of this slot.
+                        if let Some(f) = reload_slot.borrow().as_ref() {
+                            f();
+                        }
+                    }
+                    moved > 0
+                }
+            ));
+            row.add_controller(drop);
 
             // Size and Owner columns. Fixed widths so they line up under the sort headers --
             // this is a ListView, not a ColumnView, so the alignment is ours to maintain.
@@ -364,6 +442,7 @@ fn build_ui(app: &adw::Application) {
             });
         })
     };
+    *reload_slot.borrow_mut() = Some(reload.clone());
 
     // ---- navigate: change folder (records history) --------------------------------------------
     let navigate: Rc<dyn Fn(PathBuf)> = {
@@ -906,6 +985,16 @@ fn item_at(selection: &gtk::MultiSelection, pos: u32) -> Option<Entry> {
 }
 
 /// All currently-selected entries.
+/// The Entry a recycled ListItem is showing RIGHT NOW.
+///
+/// Never capture an Entry in a row's controller: the ListView reuses row widgets, so a captured
+/// value belongs to whatever file happened to be there when the widget was built.
+fn entry_of(item: &gtk::ListItem) -> Option<Entry> {
+    item.item()
+        .and_downcast::<BoxedAnyObject>()
+        .map(|b| b.borrow::<Entry>().clone())
+}
+
 fn selected(selection: &gtk::MultiSelection) -> Vec<Entry> {
     let bitset = selection.selection();
     let mut out = Vec::new();
