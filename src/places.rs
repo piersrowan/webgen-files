@@ -680,7 +680,11 @@ fn add_mount_dialog(
     form.set_margin_end(12);
     form.set_margin_bottom(6);
 
-    let kind = gtk::DropDown::from_strings(&[Transport::Sshfs.label(), Transport::Nfs.label()]);
+    let kind = gtk::DropDown::from_strings(&[
+        Transport::Sshfs.label(),
+        Transport::Nfs.label(),
+        Transport::Cifs.label(),
+    ]);
     let name = gtk::Entry::new();
     name.set_placeholder_text(Some("Name  (e.g. webgen-www)"));
     let host = gtk::Entry::new();
@@ -692,9 +696,19 @@ fn add_mount_dialog(
     let remote = gtk::Entry::new();
     remote.set_placeholder_text(Some("Remote path  (e.g. /var/www)"));
 
+    // SMB only. Hidden for SSH (keys) and NFS (no auth at all), so the form does not ask for a
+    // secret it will not use.
+    let password = gtk::PasswordEntry::new();
+    password.set_show_peek_icon(true);
+    password.set_placeholder_text(Some("Password  (SMB only)"));
+    let remember = gtk::CheckButton::with_label("Remember this password in the vault");
+    remember.set_active(true);
+
     for w in [&name, &host, &user, &port, &remote] {
         form.append(w);
     }
+    form.append(&password);
+    form.append(&remember);
     form.prepend(&kind);
 
     // Read-only by default. A share is browsed far more often than edited, and a read-only
@@ -702,16 +716,60 @@ fn add_mount_dialog(
     let writable = gtk::CheckButton::with_label("Allow writing (default is read-only)");
     form.append(&writable);
 
-    // No password field, deliberately -- see the module docs on mounts.rs. Say so rather than
-    // leaving the user hunting for it.
-    let note = gtk::Label::new(Some(
-        "SSH connections use your existing SSH key. No passwords are stored.",
-    ));
+    let note = gtk::Label::new(None);
     note.add_css_class("dim-label");
     note.add_css_class("caption");
     note.set_wrap(true);
     note.set_xalign(0.0);
     form.append(&note);
+
+    // The three transports want genuinely different things, and a form that shows all of it at
+    // once is a form that asks SSH users for a password they do not have. Retitle and hide.
+    let sync_form = {
+        let (password, remember, note, remote, user, port) = (
+            password.clone(),
+            remember.clone(),
+            note.clone(),
+            remote.clone(),
+            user.clone(),
+            port.clone(),
+        );
+        move |sel: u32| {
+            let is_smb = sel == 2;
+            password.set_visible(is_smb);
+            remember.set_visible(is_smb);
+            port.set_visible(sel == 0);
+            match sel {
+                0 => {
+                    remote.set_placeholder_text(Some("Remote path  (e.g. /var/www)"));
+                    user.set_placeholder_text(Some("User  (optional)"));
+                    note.set_text("SSH uses your existing key. Nothing secret is stored.");
+                }
+                1 => {
+                    remote.set_placeholder_text(Some("Export path  (e.g. / for an fsid=0 export)"));
+                    user.set_placeholder_text(Some("User  (unused for NFS)"));
+                    note.set_text(
+                        "NFS has no password: the server decides who may mount it, by address.",
+                    );
+                }
+                _ => {
+                    // SMB addresses a share by NAME, not by the server's directory path -- typing
+                    // /home/share here is the commonest way to get "No such file or directory".
+                    remote.set_placeholder_text(Some("Share name  (e.g. share — not a path)"));
+                    user.set_placeholder_text(Some("User  (the SMB account)"));
+                    note.set_text(
+                        "The password is stored in webgen-vault, never in the file manager's \
+                         settings. It is written to a temporary file only while mounting.",
+                    );
+                }
+            }
+        }
+    };
+    sync_form(0);
+    kind.connect_selected_notify({
+        let sync_form = sync_form.clone();
+        move |k| sync_form(k.selected())
+    });
 
     dialog.set_extra_child(Some(&form));
     dialog.add_response("cancel", "Cancel");
@@ -724,7 +782,11 @@ fn add_mount_dialog(
             d.close();
             return;
         }
-        let transport = if kind.selected() == 0 { Transport::Sshfs } else { Transport::Nfs };
+        let transport = match kind.selected() {
+            0 => Transport::Sshfs,
+            1 => Transport::Nfs,
+            _ => Transport::Cifs,
+        };
         let def = MountDef {
             name: name.text().trim().replace('/', "-"),
             transport,
@@ -738,24 +800,75 @@ fn add_mount_dialog(
             d.set_body("Name, host and remote path are all needed.");
             return;
         }
+        // SMB authenticates as a named account; without a user there is nothing to authenticate,
+        // and mount fails with a bare "permission denied" that says nothing about why.
+        if transport.needs_password() && def.user.is_empty() {
+            d.set_body("An SMB share needs the user it should connect as.");
+            return;
+        }
+        let pw = password.text().to_string();
+        if transport.needs_password() && pw.is_empty() {
+            // Only an error if nothing is saved either -- reconnecting a known share should not
+            // demand the password be retyped.
+            if crate::mounts::vault_password(&crate::mounts::vault_entry(&def.name)).is_none() {
+                d.set_body("This SMB share has no saved password. Enter it once and it will be kept in the vault.");
+                return;
+            }
+        }
+        // Store BEFORE mounting: if the mount fails for an unrelated reason (server down), the
+        // credential is still saved and the retry does not ask again.
+        if transport.needs_password() && !pw.is_empty() && remember.is_active() {
+            if let Err(e) = crate::mounts::vault_save(
+                &crate::mounts::vault_entry(&def.name),
+                &def.user,
+                &pw,
+            ) {
+                // Not fatal: mount with what was typed, and say the saving part failed. Refusing
+                // to connect because the vault is locked would be worse than connecting once.
+                d.set_body(&format!("Could not save to the vault ({e}). Connecting anyway."));
+            }
+        }
         d.close();
         crate::mounts::save(&reg, &def);
-        connect(def, after.clone(), d.transient_for());
+        let once = if pw.is_empty() { None } else { Some(pw) };
+        connect(def, after.clone(), d.transient_for(), once);
     });
     dialog.present();
 }
 
 /// Mount a saved definition, off the UI thread, reporting failure in a dialog.
+/// Mount a saved definition.
+///
+/// `password` is the one just typed, if any. When it is `None` and the transport needs one, the
+/// vault is asked -- so a saved share reconnects without a prompt, which is the whole point of
+/// storing it.
 fn connect(
     def: crate::mounts::MountDef,
     after: std::rc::Rc<dyn Fn()>,
     parent: Option<gtk::Window>,
+    password: Option<String>,
 ) {
     gtk::glib::spawn_future_local(async move {
         let d = def.clone();
         let result = gtk::gio::spawn_blocking(move || {
             crate::mounts::ensure_target(&d)?;
-            crate::mounts::run(&d.mount_argv(), d.transport.needs_root())
+            if d.transport.needs_password() {
+                let pw = password
+                    .or_else(|| {
+                        crate::mounts::vault_password(&crate::mounts::vault_entry(&d.name))
+                    })
+                    .ok_or_else(|| {
+                        "no password for this share, and the vault did not supply one \
+                         (is it locked? run `webgen-vault unlock`)"
+                            .to_string()
+                    })?;
+                // The file is deleted when `creds` drops -- at the end of this block, whether the
+                // mount worked or not.
+                let creds = crate::mounts::write_credentials(&d.user, &pw)?;
+                crate::mounts::run(&d.mount_argv_creds(Some(creds.path())), true)
+            } else {
+                crate::mounts::run(&d.mount_argv(), d.transport.needs_root())
+            }
         })
         .await;
 
@@ -823,7 +936,8 @@ fn saved_row(
     {
         let (def, after) = (def.clone(), after.clone());
         connect_btn.connect_clicked(move |b| {
-            connect(def.clone(), after.clone(), b.root().and_downcast::<gtk::Window>());
+            // No password passed: a saved share pulls it from the vault.
+            connect(def.clone(), after.clone(), b.root().and_downcast::<gtk::Window>(), None);
         });
     }
     row.append(&connect_btn);
