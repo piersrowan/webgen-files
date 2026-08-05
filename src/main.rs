@@ -64,9 +64,55 @@ fn store_show_details(reg: &Reg, on: bool) {
     }
 }
 
+/// The running window's navigate function, so a second invocation can steer it.
+///
+/// GTK is single-threaded, so a thread-local is the whole mechanism. `build_ui` publishes its
+/// `navigate` here once the window exists; `connect_open` uses it when one already does.
+thread_local! {
+    static NAVIGATE: RefCell<Option<Rc<dyn Fn(PathBuf)>>> = const { RefCell::new(None) };
+    /// A folder asked for before the window existed, consumed by `build_ui` on cold start.
+    static PENDING: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
 fn main() -> glib::ExitCode {
-    let app = adw::Application::builder().application_id(APP_ID).build();
+    // HANDLES_OPEN is what makes `webgen-files /some/path` mean anything. Without it the app was a
+    // bare Application that ignored its arguments entirely: the .desktop advertised `Exec=%F`, and
+    // the binary dropped whatever it was handed -- so every attempt to open a folder from another
+    // app started Files at $HOME and looked like nothing had happened (found 2026-08-05, via
+    // webgen-calendar). CONTRACT.md §5 requires this of any app that opens documents.
+    let app = adw::Application::builder()
+        .application_id(APP_ID)
+        .flags(gio::ApplicationFlags::HANDLES_OPEN)
+        .build();
     app.connect_activate(build_ui);
+    app.connect_open(|app, files, _| {
+        // A file is opened by showing the folder that holds it; a folder is opened directly.
+        let target = files.iter().find_map(|f| f.path()).map(|p| {
+            if p.is_dir() {
+                p
+            } else {
+                p.parent().map(|q| q.to_path_buf()).unwrap_or(p)
+            }
+        });
+
+        let warm = app.active_window().is_some();
+        if warm {
+            // §5: files must open in the RUNNING instance, not a second competing window.
+            if let Some(t) = target {
+                NAVIGATE.with(|n| {
+                    if let Some(go) = n.borrow().as_ref() {
+                        go(t);
+                    }
+                });
+            }
+            if let Some(w) = app.active_window() {
+                w.present();
+            }
+        } else {
+            PENDING.with(|c| *c.borrow_mut() = target);
+            build_ui(app);
+        }
+    });
     app.run()
 }
 
@@ -76,7 +122,11 @@ fn build_ui(app: &adw::Application) {
         assoc::seed_defaults(r);
     }
 
-    let start = glib::home_dir();
+    // A folder handed to us on the command line wins over $HOME for this window.
+    let start = PENDING
+        .with(|c| c.borrow_mut().take())
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(glib::home_dir);
     let current = Rc::new(RefCell::new(start.clone()));
     let history = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
     let forward = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
@@ -471,6 +521,9 @@ fn build_ui(app: &adw::Application) {
             reload();
         })
     };
+
+    // Publish it so a later `webgen-files <dir>` can steer THIS window instead of opening another.
+    NAVIGATE.with(|n| *n.borrow_mut() = Some(navigate.clone()));
 
     // ---- window (needed as dialog parent) ------------------------------------------------------
     let tree_pane = tree::build(
