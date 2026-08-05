@@ -6,6 +6,12 @@ GenericName=File Manager
 Comment=Browse, search, and open your files and folders
 # %F lets other apps hand folders to open; the binary is `webgen-files`.
 Exec=webgen-files %F
+# Registers Files as THE handler for a folder. Without this the %F above achieves nothing for
+# anyone else: `inode/directory` had no registered handler at all, so any app asking the desktop to
+# open a folder got nothing back and had to name webgen-files itself. Found 2026-08-05 when
+# webgen-calendar's [Open] buttons could not open a linked folder.
+# x-directory/normal is the legacy spelling some tools still ask for.
+MimeType=inode/directory;x-directory/normal;
 Icon=com.webgen.Files
 Terminal=false
 Categories=System;Utility;FileManager;GTK;
