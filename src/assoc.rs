@@ -33,6 +33,10 @@ pub const PROGRAMS: &[Program] = &[
     Program { command: "webgen", name: "Browser", icon: "com.webgen.WebGen" },
     Program { command: "webgen-edit", name: "Edit", icon: "com.webgen.Edit" },
     Program { command: "webgen-terminal", name: "Terminal", icon: "com.webgen.Terminal" },
+    // Word joins the list because it is the app that opens .docx (Piers, 2026-08-06). It is a
+    // repo_only package: naming a program that may not be installed is harmless — Open With
+    // reports the launch failure — and the alternative, hiding it, is worse.
+    Program { command: "webgen-word", name: "Word", icon: "com.webgen.Word" },
 ];
 
 /// The sane defaults seeded on first run (matches the brief: htm*→Browser, txt/csv/php→Edit, sh→Terminal).
@@ -44,6 +48,8 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("csv", "webgen-edit"),
     ("php", "webgen-edit"),
     ("sh", "webgen-terminal"),
+    // Word documents: converted on open (html + pictures beside the original), never modified.
+    ("docx", "webgen-word"),
 ];
 
 /// The lowercase extension (no dot) of a file name, e.g. `Report.TXT` → `txt`. `None` if there is
